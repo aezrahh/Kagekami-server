@@ -1,0 +1,12 @@
+# Render Blueprint: the Deploy to Render button reads this and creates the server.
+services:
+  - type: web
+    name: kagekami-server
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /status
+    envVars:
+      - key: KK_PASSWORD
+        sync: false   # Render asks for it while deploying; leave it empty for an open server
