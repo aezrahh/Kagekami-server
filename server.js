@@ -24,7 +24,7 @@
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 const MAX_PRESENCE = 4096, MAX_ROOMS_PER_CLIENT = 4, MAX_MSGS_PER_SEC = 120, MAX_BYTES_PER_SEC = 64 * 1024, ROOM_RE = /^[a-z0-9-]{1,32}$/;
 const MAX_ROOM_MEMBERS = 30, MAX_JOINS_PER_MIN = 20, LOBBY = 'lobby';
 const TOK_RE = /^[A-Za-z0-9_-]{16,128}$/, CID_RE = /^[A-Za-z0-9_-]{1,40}$/, PUB_RE = /^p[0-9a-f]{20}$/;
@@ -38,6 +38,8 @@ function start(o = {}) {
   const log = o.log || (m => console.log(new Date().toISOString(), m));
   const maxConns = +o.maxConnections || 300, maxPerIp = +o.maxPerAddress || 16, trustProxy = !!o.trustProxy;
   // the key that turns private tokens into public ids; new on every start unless KK_SECRET is set
+  // Set it (KK_SECRET; on Render it is derived from the service) so players keep their IDs, and with them their seats,
+  // across a restart or deploy.
   const secret = o.secret ? String(o.secret) : crypto.randomBytes(32).toString('hex');
   const pubId = tok => 'p' + crypto.createHmac('sha256', secret).update(tok).digest('hex').slice(0, 20);
   const pwHash = crypto.createHash('sha256').update(password).digest();
@@ -48,7 +50,8 @@ function start(o = {}) {
   const fails = new Map();   // address -> { n, until }: wrong passwords
   const sweep = setInterval(() => { const now = Date.now(); for (const [k, f] of fails) if (f.until < now && now - f.at > 600000) fails.delete(k); }, 60000);
 
-  const server = http.createServer((req, res) => {
+  const server = http.createServer((req, res) => { try { serveHttp(req, res); } catch (e) { log('HTTP error: ' + (e && e.message)); try { res.writeHead(500); res.end(); } catch (x) {} } });
+  function serveHttp(req, res) {
     const hdr = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' };
     let u, rel; try { u = new URL(req.url, 'http://x'); rel = decodeURIComponent(u.pathname).replace(/^\/+/, ''); } catch (e) { res.writeHead(400, hdr); res.end(); return; }
     if (rel === 'status') { res.writeHead(200, { ...hdr, 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify({ kageKami: true, version: VERSION, rooms: rooms.size, players: count(), game: !!game })); return; }
@@ -57,12 +60,13 @@ function start(o = {}) {
     const f = path.join(game, ...rel.split('/'));
     if (rel.split('/').some(s => s === '..' || s === '' || s.startsWith('.')) || !f.startsWith(game + path.sep) || !fs.existsSync(f) || !fs.statSync(f).isFile()) { res.writeHead(404, hdr); res.end('not found'); return; }
     res.writeHead(200, { ...hdr, 'content-type': TYPES[path.extname(f).toLowerCase()] || 'application/octet-stream', 'cache-control': rel === 'manifest.json' || rel === 'index.html' ? 'no-store' : 'max-age=3600', 'access-control-allow-origin': '*' });
-    fs.createReadStream(f).pipe(res);
-  });
+    fs.createReadStream(f).on('error', () => res.destroy()).pipe(res);
+  }
   const wss = new WebSocketServer({ server, maxPayload: 16 * 1024, perMessageDeflate: false });
   const count = () => wss.clients.size;
   const info = c => ({ peer: c.peer, by: c.by, name: c.name });
-  const send = (ws, m) => { if (ws.readyState === 1) ws.send(JSON.stringify(m)); };
+  // a client that stops reading (over 1 MiB waiting) is dropped instead of filling the server's memory
+  const send = (ws, m) => { if (ws.readyState !== 1) return; if (ws.bufferedAmount > 1 << 20) { ws.terminate(); return; } ws.send(JSON.stringify(m)); };
   const addrOf = req => {
     const fwd = trustProxy && String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
     return fwd || req.socket.remoteAddress || '?';
@@ -120,7 +124,9 @@ function start(o = {}) {
     perIp.set(addr, (perIp.get(addr) || 0) + 1);
     const c = { ws, peer: crypto.randomBytes(8).toString('hex'), by: null, name: '', ok: false, rooms: new Map(), n: 0, bytes: 0, t0: Date.now(), joins: [] };
     ws._kkAlive = true; ws.on('pong', () => { ws._kkAlive = true; });
-    ws.on('message', buf => {
+    // one bad message drops only itself, never the server and everyone's matches
+    ws.on('message', buf => { try { handle(buf); } catch (e) { log('Dropped a message that caused an error: ' + (e && e.message)); } });
+    const handle = buf => {
       const now = Date.now(); if (now - c.t0 > 1000) { c.t0 = now; c.n = 0; c.bytes = 0; }
       c.bytes += buf.length; if (++c.n > MAX_MSGS_PER_SEC || c.bytes > MAX_BYTES_PER_SEC) return;   // flood guard
       let m; try { m = JSON.parse(buf.toString('utf8')); } catch (e) { return; } if (!m || typeof m !== 'object' || Array.isArray(m)) return;
@@ -160,7 +166,7 @@ function start(o = {}) {
         mine.p = p; mine.at = now;
         for (const o of room.members.values()) if (o !== c) send(o.ws, { t: 'p', r, ...info(c), p, at: now });
       } else if (m.t === 'leave') leave(c, r);
-    });
+    };
     ws.on('close', () => { for (const r of [...c.rooms.keys()]) leave(c, r); const n = (perIp.get(addr) || 1) - 1; if (n > 0) perIp.set(addr, n); else perIp.delete(addr); });
     ws.on('error', () => {});
   });
@@ -169,7 +175,10 @@ function start(o = {}) {
     server.once('error', bad);
     server.listen(port, host, () => {
       log(`Kage Kami server ${VERSION} on ${host || 'all addresses'}, port ${port}${password ? ' (password set)' : ''}${game ? ', serving ' + game : ''}`);
-      ok({ port, stop: () => new Promise(res => { clearInterval(hb); clearInterval(sweep); wss.clients.forEach(w => w.terminate()); wss.close(); server.close(() => res()); }), stats: () => ({ rooms: rooms.size, players: count() }) });
+      // before a restart: tell everyone, and close with "service restart" so the games reconnect to the new server
+      // straight away and carry on (the matches themselves live in the players' games)
+      const drain = msg => { wss.clients.forEach(w => { send(w, { t: 'err', m: msg || 'The server is restarting. Reconnecting…' }); try { w.close(1012, 'restart'); } catch (e) {} }); };
+      ok({ port, drain, stop: () => new Promise(res => { clearInterval(hb); clearInterval(sweep); wss.clients.forEach(w => w.terminate()); wss.close(); server.close(() => res()); }), stats: () => ({ rooms: rooms.size, players: count() }) });
     });
   });
 }
@@ -177,7 +186,17 @@ function start(o = {}) {
 module.exports = { start, VERSION };
 if (require.main === module) {
   const a = process.argv.slice(2), get = k => { const i = a.indexOf('--' + k); return i >= 0 ? a[i + 1] : undefined; }, env = process.env;
-  start({ port: get('port') || env.PORT, host: get('host') || env.KK_HOST, password: get('password') || env.KK_PASSWORD, game: get('game'), secret: env.KK_SECRET,
+  // on Render without KK_SECRET, a stable secret from the service's own id (the same on every deploy of this service)
+  const secret = env.KK_SECRET || (env.RENDER_SERVICE_ID ? crypto.createHash('sha256').update('kagekami:' + env.RENDER_SERVICE_ID + ':' + (env.KK_PASSWORD || '')).digest('hex') : undefined);
+  const log = m => console.log(new Date().toISOString(), m);
+  process.on('uncaughtException', e => log('Error (kept running): ' + (e && e.stack || e)));
+  process.on('unhandledRejection', e => log('Error (kept running): ' + (e && e.stack || e)));
+  start({ port: get('port') || env.PORT, host: get('host') || env.KK_HOST, password: get('password') || env.KK_PASSWORD, game: get('game'), secret, log,
     trustProxy: env.KK_TRUST_PROXY === '1' || env.RENDER === 'true', maxConnections: env.KK_MAX_CONNECTIONS, maxPerAddress: env.KK_MAX_PER_ADDRESS })
+    .then(srv => {
+      let down = false;
+      const bye = () => { if (down) return; down = true; log('Shutting down: asking players to reconnect'); srv.drain(); setTimeout(() => srv.stop().then(() => process.exit(0)), 1500).unref(); setTimeout(() => process.exit(0), 5000).unref(); };
+      process.on('SIGTERM', bye); process.on('SIGINT', bye);
+    })
     .catch(e => { console.error(e.message); process.exit(1); });
 }

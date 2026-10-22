@@ -10,5 +10,7 @@ services:
     envVars:
       - key: KK_PASSWORD
         sync: false   # Render asks for it while deploying; leave it empty for an open server
+      - key: KK_SECRET
+        generateValue: true   # keeps player IDs (and seats) the same across restarts and deploys
       - key: KK_TRUST_PROXY
         value: "1"    # Render's proxy passes the player's address on; the per-address limits need it
