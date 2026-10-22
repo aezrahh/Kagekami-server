@@ -1,81 +1,183 @@
 // Kage Kami multiplayer server: a small WebSocket relay for the game's room presence (the lobby, and one room per match),
-// so online play works without claude.ai. The game's own lockstep netcode runs in the players' games; the server only
-// keeps each room's member list and their presence objects and passes changes on. Optionally it also serves a game folder
+// so online play works without claude.ai. The game's own lockstep netcode runs in the players' games; the server keeps
+// each room's member list and their presence objects and passes changes on. Optionally it also serves a game folder
 // over HTTP (index.html, manifest.json and the files next to it), so launchers can use it as their update address.
 //
-//   node server.js [--port 7420] [--password secret] [--game path/to/game]       (standalone, needs the ws package)
-//   require('./server').start({ port, password, game })                           (from the desktop app)
+//   node server.js [--port 7420] [--host 0.0.0.0] [--password secret] [--game path/to/game]   (standalone, needs ws)
+//   require('./server').start({ port, host, password, game })                                  (from the desktop app)
 //
-// Messages (JSON), client to server: {t:"hello", by, name, pw}  {t:"join", r}  {t:"p", r, p}  {t:"leave", r}
-// server to client: {t:"welcome", peer}  {t:"snap", r, peers:[{peer,by,name,p,at}]}  {t:"p", r, peer, by, name, p, at}  {t:"bye", r, peer}  {t:"err", m}
+// Messages (JSON), client to server: {t:"hello", tok, name, pw}  {t:"join", r}  {t:"p", r, p}  {t:"leave", r}
+// server to client: {t:"welcome", peer, by}  {t:"snap", r, peers:[{peer,by,name,p,at}]}  {t:"p", r, peer, by, name, p, at}
+//                   {t:"bye", r, peer}  {t:"err", m, r?}
+//
+// Security and privacy (server 2.0):
+// - Player IDs are issued by the server. A client sends a private token; everyone else only ever sees `by`, a keyed hash
+//   of it, so nobody can claim another player's ID or seat. (Older clients send their old id as `by`; it is used as the
+//   token the same way, so they never see each other's raw ids either.)
+// - In a room, a presence `cid` belongs to the first connection that used it (or the same player reconnecting).
+// - Only the room's current host may publish host fields (host, set, seats, the match and its turns). Another member may
+//   take over only when the host is hidden or gone, which is when the game itself hands hosting over.
+// - While a match is being set up or running, only players who hold a seat in it can join the room.
+// - Limits: connections per address and in total, wrong passwords per address, joins per minute, members per room,
+//   messages and bytes per second.
+// - Nothing about players is logged or written to disk. Addresses are kept in memory only, for the limits above.
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
-const MAX_PRESENCE = 4096, MAX_ROOMS_PER_CLIENT = 4, MAX_MSGS_PER_SEC = 120, ROOM_RE = /^[a-z0-9-]{1,32}$/;
+const VERSION = '2.0.0';
+const MAX_PRESENCE = 4096, MAX_ROOMS_PER_CLIENT = 4, MAX_MSGS_PER_SEC = 120, MAX_BYTES_PER_SEC = 64 * 1024, ROOM_RE = /^[a-z0-9-]{1,32}$/;
+const MAX_ROOM_MEMBERS = 30, MAX_JOINS_PER_MIN = 20, LOBBY = 'lobby';
+const TOK_RE = /^[A-Za-z0-9_-]{16,128}$/, CID_RE = /^[A-Za-z0-9_-]{1,40}$/, PUB_RE = /^p[0-9a-f]{20}$/;
+// fields only the room's host may publish (the game's lockstep host state)
+const HOST_KEYS = ['host', 'he', 'set', 'seats', 'mt', 'st', 'T', 'K', 'po', 'drop', 'ds', 'props'];
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg', '.webp': 'image/webp',
   '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.glb': 'model/gltf-binary', '.svg': 'image/svg+xml', '.txt': 'text/plain; charset=utf-8' };
 
 function start(o = {}) {
-  const port = +o.port || 7420, password = o.password ? String(o.password) : '', game = o.game ? path.resolve(o.game) : null, log = o.log || (m => console.log(new Date().toISOString(), m));
-  const rooms = new Map();   // name -> Map(peer -> client)
+  const port = +o.port || 7420, host = o.host || undefined, password = o.password ? String(o.password) : '', game = o.game ? path.resolve(o.game) : null;
+  const log = o.log || (m => console.log(new Date().toISOString(), m));
+  const maxConns = +o.maxConnections || 300, maxPerIp = +o.maxPerAddress || 16, trustProxy = !!o.trustProxy;
+  // the key that turns private tokens into public ids; new on every start unless KK_SECRET is set
+  const secret = o.secret ? String(o.secret) : crypto.randomBytes(32).toString('hex');
+  const pubId = tok => 'p' + crypto.createHmac('sha256', secret).update(tok).digest('hex').slice(0, 20);
+  const pwHash = crypto.createHash('sha256').update(password).digest();
+  const pwOk = pw => crypto.timingSafeEqual(crypto.createHash('sha256').update(typeof pw === 'string' ? pw : '').digest(), pwHash);
+
+  const rooms = new Map();   // name -> { members: Map(peer -> client), host: peer | null }
+  const perIp = new Map();   // address -> open connections
+  const fails = new Map();   // address -> { n, until }: wrong passwords
+  const sweep = setInterval(() => { const now = Date.now(); for (const [k, f] of fails) if (f.until < now && now - f.at > 600000) fails.delete(k); }, 60000);
+
   const server = http.createServer((req, res) => {
-    const u = new URL(req.url, 'http://x'); let rel = decodeURIComponent(u.pathname).replace(/^\/+/, '');
-    if (rel === 'status') { res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify({ kageKami: true, rooms: rooms.size, players: count(), game: !!game })); return; }
-    if (!game) { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('Kage Kami multiplayer server is running.\n'); return; }
+    const hdr = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' };
+    let u, rel; try { u = new URL(req.url, 'http://x'); rel = decodeURIComponent(u.pathname).replace(/^\/+/, ''); } catch (e) { res.writeHead(400, hdr); res.end(); return; }
+    if (rel === 'status') { res.writeHead(200, { ...hdr, 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify({ kageKami: true, version: VERSION, rooms: rooms.size, players: count(), game: !!game })); return; }
+    if (!game) { res.writeHead(200, { ...hdr, 'content-type': 'text/plain' }); res.end('Kage Kami multiplayer server is running.\n'); return; }
     if (!rel) rel = 'index.html';
     const f = path.join(game, ...rel.split('/'));
-    if (rel.split('/').some(s => s === '..' || s === '') || !f.startsWith(game + path.sep) || !fs.existsSync(f) || !fs.statSync(f).isFile()) { res.writeHead(404); res.end('not found'); return; }
-    res.writeHead(200, { 'content-type': TYPES[path.extname(f).toLowerCase()] || 'application/octet-stream', 'cache-control': rel === 'manifest.json' || rel === 'index.html' ? 'no-store' : 'max-age=3600', 'access-control-allow-origin': '*' });
+    if (rel.split('/').some(s => s === '..' || s === '' || s.startsWith('.')) || !f.startsWith(game + path.sep) || !fs.existsSync(f) || !fs.statSync(f).isFile()) { res.writeHead(404, hdr); res.end('not found'); return; }
+    res.writeHead(200, { ...hdr, 'content-type': TYPES[path.extname(f).toLowerCase()] || 'application/octet-stream', 'cache-control': rel === 'manifest.json' || rel === 'index.html' ? 'no-store' : 'max-age=3600', 'access-control-allow-origin': '*' });
     fs.createReadStream(f).pipe(res);
   });
-  const wss = new WebSocketServer({ server, maxPayload: 16 * 1024 });
-  const count = () => { let n = 0; wss.clients.forEach(() => n++); return n; };
+  const wss = new WebSocketServer({ server, maxPayload: 16 * 1024, perMessageDeflate: false });
+  const count = () => wss.clients.size;
   const info = c => ({ peer: c.peer, by: c.by, name: c.name });
   const send = (ws, m) => { if (ws.readyState === 1) ws.send(JSON.stringify(m)); };
+  const addrOf = req => {
+    const fwd = trustProxy && String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    return fwd || req.socket.remoteAddress || '?';
+  };
+  const isHostP = p => p && p.host === 1;
+
   function leave(c, r) {
-    const room = rooms.get(r); if (!room || !room.has(c.peer)) return;
-    room.delete(c.peer); c.rooms.delete(r);
-    for (const o of room.values()) send(o.ws, { t: 'bye', r, peer: c.peer });
-    if (!room.size) rooms.delete(r);
+    const room = rooms.get(r); if (!room || !room.members.has(c.peer)) return;
+    room.members.delete(c.peer); c.rooms.delete(r);
+    if (room.host === c.peer) room.host = null;
+    for (const o of room.members.values()) send(o.ws, { t: 'bye', r, peer: c.peer });
+    if (!room.members.size) rooms.delete(r);
   }
+  // the seat list the room's host publishes: [[pid, slot, by?], ...]
+  function roomSeats(room) {
+    const h = room.host && room.members.get(room.host); const p = h && h.rooms.get(room.name).p;
+    return p && Array.isArray(p.seats) ? p.seats : [];
+  }
+  function matchLocked(room) {
+    const h = room.host && room.members.get(room.host); const p = h && h.rooms.get(room.name).p;
+    return !!(p && (p.st === 'prep' || p.st === 'run'));
+  }
+  // decide what of a member's presence the others get to see
+  function filterPresence(c, room, r, p) {
+    const out = {};
+    for (const k in p) out[k] = p[k];
+    // a cid names one player in the room; nobody else may use it
+    if ('cid' in out) {
+      if (typeof out.cid !== 'string' || !CID_RE.test(out.cid)) delete out.cid;
+      else for (const o of room.members.values()) {
+        if (o === c) continue; const op = o.rooms.get(r).p;
+        if (op && op.cid === out.cid) {
+          if (o.by === c.by) { leave(o, r); break; }            // the same player reconnected: the old connection gives way
+          delete out.cid; break;
+        }
+      }
+    }
+    // host fields: only from the current host, or from a member taking over when the host is hidden or gone
+    const claims = isHostP(out);
+    if (room.host !== c.peer) {
+      const h = room.host && room.members.get(room.host), hp = h && h.rooms.get(r).p;
+      const canTake = !h || !isHostP(hp) || hp.vis === 0;
+      if (claims && canTake) room.host = c.peer;
+      else for (const k of HOST_KEYS) if (k in out && out[k] !== null) delete out[k];
+    } else if (out.host === null || ('host' in out && out.host !== 1)) room.host = null;
+    return out;
+  }
+
   wss.on('connection', (ws, req) => {
-    const c = { ws, peer: crypto.randomBytes(6).toString('hex'), by: null, name: '', ok: !password, rooms: new Map(), n: 0, t0: Date.now() };
+    const addr = addrOf(req);
+    const f = fails.get(addr);
+    if (f && f.until > Date.now()) { send(ws, { t: 'err', m: 'Too many wrong passwords. Try again in a few minutes.' }); ws.close(); return; }
+    if (count() > maxConns) { send(ws, { t: 'err', m: 'The server is full.' }); ws.close(); return; }
+    if ((perIp.get(addr) || 0) >= maxPerIp) { send(ws, { t: 'err', m: 'Too many connections from your address.' }); ws.close(); return; }
+    perIp.set(addr, (perIp.get(addr) || 0) + 1);
+    const c = { ws, peer: crypto.randomBytes(8).toString('hex'), by: null, name: '', ok: false, rooms: new Map(), n: 0, bytes: 0, t0: Date.now(), joins: [] };
+    ws._kkAlive = true; ws.on('pong', () => { ws._kkAlive = true; });
     ws.on('message', buf => {
-      const now = Date.now(); if (now - c.t0 > 1000) { c.t0 = now; c.n = 0; } if (++c.n > MAX_MSGS_PER_SEC) return;   // flood guard
-      let m; try { m = JSON.parse(buf.toString('utf8')); } catch (e) { return; } if (!m || typeof m !== 'object') return;
+      const now = Date.now(); if (now - c.t0 > 1000) { c.t0 = now; c.n = 0; c.bytes = 0; }
+      c.bytes += buf.length; if (++c.n > MAX_MSGS_PER_SEC || c.bytes > MAX_BYTES_PER_SEC) return;   // flood guard
+      let m; try { m = JSON.parse(buf.toString('utf8')); } catch (e) { return; } if (!m || typeof m !== 'object' || Array.isArray(m)) return;
       if (m.t === 'hello') {
-        if (password && m.pw !== password) { send(ws, { t: 'err', m: 'Wrong server password.' }); ws.close(); return; }
-        c.ok = true; c.by = typeof m.by === 'string' && /^[a-zA-Z0-9_-]{2,40}$/.test(m.by) ? m.by : 'g' + c.peer; c.name = String(m.name || '').slice(0, 24);
-        send(ws, { t: 'welcome', peer: c.peer, by: c.by }); return;
+        if (c.ok) return;
+        if (password && !pwOk(m.pw)) {
+          const x = fails.get(addr) || { n: 0, until: 0, at: now }; if (now - x.at > 600000) { x.n = 0; x.at = now; }
+          if (++x.n >= 5) { x.until = now + 600000; x.n = 0; x.at = now; } fails.set(addr, x);
+          send(ws, { t: 'err', m: 'Wrong server password.' }); ws.close(); return;
+        }
+        // a public id (what an older client sends back after a reconnect) is never accepted as a token
+        const okTok = t => typeof t === 'string' && TOK_RE.test(t) && !PUB_RE.test(t);
+        const tok = okTok(m.tok) ? m.tok : okTok(m.by) ? m.by : crypto.randomBytes(16).toString('hex');
+        c.ok = true; c.by = pubId(tok); c.name = String(m.name || '').replace(/[\u0000-\u001f\u007f<>]/g, '').trim().slice(0, 24);
+        send(ws, { t: 'welcome', peer: c.peer, by: c.by, v: VERSION }); return;
       }
       if (!c.ok) return;
       const r = typeof m.r === 'string' && ROOM_RE.test(m.r) ? m.r : null; if (!r) return;
       if (m.t === 'join') {
-        if (c.rooms.has(r)) return; if (c.rooms.size >= MAX_ROOMS_PER_CLIENT) { send(ws, { t: 'err', m: 'Too many rooms.' }); return; }
-        let room = rooms.get(r); if (!room) rooms.set(r, room = new Map());
-        c.rooms.set(r, { p: {}, at: now }); room.set(c.peer, c);
-        send(ws, { t: 'snap', r, peers: [...room.values()].filter(o => o !== c).map(o => ({ ...info(o), p: o.rooms.get(r).p, at: o.rooms.get(r).at })) });
-        for (const o of room.values()) if (o !== c) send(o.ws, { t: 'p', r, ...info(c), p: {}, at: now });
+        if (c.rooms.has(r)) return; if (c.rooms.size >= MAX_ROOMS_PER_CLIENT) { send(ws, { t: 'err', r, m: 'Too many rooms.' }); return; }
+        c.joins = c.joins.filter(t => now - t < 60000); if (c.joins.length >= MAX_JOINS_PER_MIN) { send(ws, { t: 'err', r, m: 'Too many rooms joined. Wait a minute.' }); return; }
+        c.joins.push(now);
+        let room = rooms.get(r);
+        if (room && r !== LOBBY) {
+          if (room.members.size >= MAX_ROOM_MEMBERS) { send(ws, { t: 'err', r, m: 'That room is full.' }); return; }
+          // during a match only its players may come (back) in
+          if (matchLocked(room) && !roomSeats(room).some(s => Array.isArray(s) && s[2] === c.by)) { send(ws, { t: 'err', r, m: 'A match is in progress in that room.' }); return; }
+        }
+        if (!room) rooms.set(r, room = { name: r, members: new Map(), host: null });
+        c.rooms.set(r, { p: {}, at: now }); room.members.set(c.peer, c);
+        send(ws, { t: 'snap', r, peers: [...room.members.values()].filter(o => o !== c).map(o => ({ ...info(o), p: o.rooms.get(r).p, at: o.rooms.get(r).at })) });
+        for (const o of room.members.values()) if (o !== c) send(o.ws, { t: 'p', r, ...info(c), p: {}, at: now });
       } else if (m.t === 'p') {
-        const mine = c.rooms.get(r); if (!mine || !m.p || typeof m.p !== 'object' || Array.isArray(m.p)) return;
-        if (Buffer.byteLength(JSON.stringify(m.p)) > MAX_PRESENCE) { send(ws, { t: 'err', m: 'Presence over 4 KiB.' }); return; }
-        mine.p = m.p; mine.at = now;
-        for (const o of rooms.get(r).values()) if (o !== c) send(o.ws, { t: 'p', r, ...info(c), p: m.p, at: now });
+        const mine = c.rooms.get(r), room = rooms.get(r); if (!mine || !room || !m.p || typeof m.p !== 'object' || Array.isArray(m.p)) return;
+        if (Buffer.byteLength(JSON.stringify(m.p)) > MAX_PRESENCE) { send(ws, { t: 'err', r, m: 'Presence over 4 KiB.' }); return; }
+        const p = r === LOBBY ? m.p : filterPresence(c, room, r, m.p);
+        mine.p = p; mine.at = now;
+        for (const o of room.members.values()) if (o !== c) send(o.ws, { t: 'p', r, ...info(c), p, at: now });
       } else if (m.t === 'leave') leave(c, r);
     });
-    ws.on('close', () => { for (const r of [...c.rooms.keys()]) leave(c, r); });
+    ws.on('close', () => { for (const r of [...c.rooms.keys()]) leave(c, r); const n = (perIp.get(addr) || 1) - 1; if (n > 0) perIp.set(addr, n); else perIp.delete(addr); });
     ws.on('error', () => {});
   });
-  const hb = setInterval(() => wss.clients.forEach(ws => { if (ws._kkDead) return ws.terminate(); ws._kkDead = true; ws.ping(); }), 15000); // drop silent connections
-  wss.on('connection', ws => ws.on('pong', () => { ws._kkDead = false; }));
+  const hb = setInterval(() => wss.clients.forEach(ws => { if (!ws._kkAlive) return ws.terminate(); ws._kkAlive = false; ws.ping(); }), 15000); // drop silent connections
   return new Promise((ok, bad) => {
     server.once('error', bad);
-    server.listen(port, () => { log(`Kage Kami server on port ${port}${password ? ' (password set)' : ''}${game ? ', serving ' + game : ''}`); ok({ port, stop: () => new Promise(r => { clearInterval(hb); wss.clients.forEach(w => w.terminate()); wss.close(); server.close(() => r()); }), stats: () => ({ rooms: rooms.size, players: count() }) }); });
+    server.listen(port, host, () => {
+      log(`Kage Kami server ${VERSION} on ${host || 'all addresses'}, port ${port}${password ? ' (password set)' : ''}${game ? ', serving ' + game : ''}`);
+      ok({ port, stop: () => new Promise(res => { clearInterval(hb); clearInterval(sweep); wss.clients.forEach(w => w.terminate()); wss.close(); server.close(() => res()); }), stats: () => ({ rooms: rooms.size, players: count() }) });
+    });
   });
 }
 
-module.exports = { start };
+module.exports = { start, VERSION };
 if (require.main === module) {
-  const a = process.argv.slice(2), get = k => { const i = a.indexOf('--' + k); return i >= 0 ? a[i + 1] : undefined; };
-  start({ port: get('port') || process.env.PORT, password: get('password') || process.env.KK_PASSWORD, game: get('game') }).catch(e => { console.error(e.message); process.exit(1); });
+  const a = process.argv.slice(2), get = k => { const i = a.indexOf('--' + k); return i >= 0 ? a[i + 1] : undefined; }, env = process.env;
+  start({ port: get('port') || env.PORT, host: get('host') || env.KK_HOST, password: get('password') || env.KK_PASSWORD, game: get('game'), secret: env.KK_SECRET,
+    trustProxy: env.KK_TRUST_PROXY === '1' || env.RENDER === 'true', maxConnections: env.KK_MAX_CONNECTIONS, maxPerAddress: env.KK_MAX_PER_ADDRESS })
+    .catch(e => { console.error(e.message); process.exit(1); });
 }
