@@ -52,6 +52,19 @@ let fails = 0; const ok = (cond, name) => { console.log((cond ? 'PASS ' : 'FAIL 
   const bad = []; for (let i = 0; i < 5; i++) { const x = client(U, { tok: 'tokenXXXXXXXXXXXXXXXXXXX', pw: 'nope' }); await x.ready; await sleep(40); bad.push(x); }
   const good = client(U, { tok: 'tokenXXXXXXXXXXXXXXXXXXX', pw: 'pw' }); await good.ready; await sleep(80);
   ok(good.last(m => m.t === 'err' && /Too many wrong/.test(m.m)) && !good.by, 'lockout after 5 wrong passwords');
+  // stability: garbage doesn't break anything, and a restart with the same secret keeps player ids
+  const s2 = await start({ port: 7533, secret: 'stable', log: () => {} });
+  const G = client('ws://127.0.0.1:7533', { tok: 'tokenGGGGGGGGGGGGGGGGGGGG' }); await G.ready; await sleep(80); G.send({ t: 'join', r: 'kr-abcd' });
+  for (const junk of ['[]', 'null', '{"t":"p","r":"kr-abcd","p":[1]}', '{"t":"join","r":{}}', '{"t":"p","r":"kr-abcd","p":{"cid":{"x":1},"host":"1"}}', '\u0000'.repeat(100)]) G.ws.send(junk);
+  await sleep(100); ok(!G.closed, 'junk messages are ignored');
+  const R1 = client('ws://127.0.0.1:7533', { tok: 'tokenRRRRRRRRRRRRRRRRRRRR' }); await R1.ready; await sleep(80);
+  let code = 0; R1.ws.on('close', c => code = c); s2.drain(); await sleep(150);
+  ok(code === 1012 && R1.msgs.some(m => m.t === 'err' && /restarting/.test(m.m)), 'restart notice and close code 1012');
+  await s2.stop();
+  const s3 = await start({ port: 7533, secret: 'stable', log: () => {} });
+  const R2 = client('ws://127.0.0.1:7533', { tok: 'tokenRRRRRRRRRRRRRRRRRRRR' }); await R2.ready; await sleep(80);
+  ok(R1.by && R2.by === R1.by, 'same secret keeps the player id across a restart');
+  await s3.stop();
   console.log(fails ? fails + ' failed' : 'all passed');
   await srv.stop(); process.exit(fails ? 1 : 0);
 })();

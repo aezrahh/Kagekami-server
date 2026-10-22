@@ -23,8 +23,19 @@ that waits up to a minute while it wakes (the game keeps retrying by itself).
 - **Encryption.** Render serves `wss://` for you. On your own server, use `install-linux.sh --domain` (Caddy and a free
   certificate). The desktop app refuses unencrypted `ws://` addresses outside your local network.
 
+## Stability (server 2.1)
+
+- **Restarts and deploys don't end matches.** Before stopping, the server tells every game it is restarting and closes
+  with the "service restart" code; the games reconnect to the new server within about a second and carry on, because
+  the matches themselves run in the players' games. Players keep their IDs (and seats) as long as the secret stays the
+  same: Render generates `KK_SECRET` for new deploys, and an existing Render service without it uses one derived from
+  the service's own id.
+- **One bad message can't take the server down.** Each message, and each HTTP request, is handled behind an error
+  guard; any other unexpected error is logged and the server keeps running.
+- **Slow clients are dropped** when more than 1 MiB is waiting to be sent to them, instead of filling the server's memory.
+
 Settings (environment variables): `KK_PASSWORD`, `PORT`, `KK_HOST` (address to listen on, for example `127.0.0.1` behind
 Caddy), `KK_TRUST_PROXY=1` (on by itself on Render; set it behind another proxy that sets `X-Forwarded-For`), `KK_SECRET` (keeps player IDs
-the same across restarts; leave it unset for the most privacy), `KK_MAX_CONNECTIONS`, `KK_MAX_PER_ADDRESS`.
+the same across restarts, so matches survive them), `KK_MAX_CONNECTIONS`, `KK_MAX_PER_ADDRESS`.
 
 Tests: `npm test`.
