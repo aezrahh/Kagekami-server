@@ -191,7 +191,7 @@ function start(o = {}) {
         store.touch(h).then(fresh => { c.acct = h; reply({ ok: true, me: Store.pubOf(h), fresh }); }, fail); return;
       }
       if (m.t === 'top') {
-        if (now - (c.topT || 0) < 2000) { reply({ err: 'busy' }); return; } c.topT = now;
+        c.tops = (c.tops || []).filter(t => now - t < 10000); if (c.tops.length >= 6) { reply({ err: 'busy' }); return; } c.tops.push(now);
         if (!Store.MODES.includes(m.mode)) { reply({ err: 'Unknown mode.' }); return; }
         store.top(m.mode, 100).then(rows => reply({ mode: m.mode, rows: rows.map(r => ({ id: Store.pubOf(r.h), nm: r.nm, mode: r.mode, tier: r.tier, seals: r.seals, mmr: r.mmr, g: r.g, w: r.w, at: r.at })) }), fail); return;
       }
