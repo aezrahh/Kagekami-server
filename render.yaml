@@ -12,5 +12,7 @@ services:
         sync: false   # Render asks for it while deploying; leave it empty for an open server
       - key: KK_SECRET
         generateValue: true   # keeps player IDs (and seats) the same across restarts and deploys
+      - key: DATABASE_URL
+        sync: false   # optional: a Postgres address (Neon's free plan or Render Postgres) turns on accounts and the leaderboard
       - key: KK_TRUST_PROXY
         value: "1"    # Render's proxy passes the player's address on; the per-address limits need it
