@@ -9,6 +9,12 @@
 // Messages (JSON), client to server: {t:"hello", tok, name, pw}  {t:"join", r}  {t:"p", r, p}  {t:"leave", r}
 // server to client: {t:"welcome", peer, by}  {t:"snap", r, peers:[{peer,by,name,p,at}]}  {t:"p", r, peer, by, name, p, at}
 //                   {t:"bye", r, peer}  {t:"err", m, r?}
+// Accounts (server 2.2, only with a database; see store.js). A request carries q, an id the reply echoes:
+//   {t:"acct", q, code} -> {t:"acct", q, ok, me}       sign in with the account code the player's launcher made
+//   {t:"save", q} -> {t:"save", q, d}                   read the account's cloud save; with d: write it (64 KiB at most)
+//   {t:"rank", q, row} -> {t:"rank", q, ok}             this account's ranked standing in one mode (ffa or duel)
+//   {t:"top", q, mode} -> {t:"top", q, mode, rows}      the leaderboard: the top 100 of a mode, with short public ids
+//   With no database every reply is {t, q, off:true}, and the game keeps everything on the player's computer.
 //
 // Security and privacy (server 2.0):
 // - Player IDs are issued by the server. A client sends a private token; everyone else only ever sees `by`, a keyed hash
@@ -24,8 +30,9 @@
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
-const VERSION = '2.1.0';
-const MAX_PRESENCE = 4096, MAX_ROOMS_PER_CLIENT = 4, MAX_MSGS_PER_SEC = 120, MAX_BYTES_PER_SEC = 64 * 1024, ROOM_RE = /^[a-z0-9-]{1,32}$/;
+const VERSION = '2.2.0';
+const Store = require('./store');
+const MAX_PRESENCE = 4096, MAX_ROOMS_PER_CLIENT = 4, MAX_MSGS_PER_SEC = 120, MAX_BYTES_PER_SEC = 96 * 1024, ROOM_RE = /^[a-z0-9-]{1,32}$/;
 const MAX_ROOM_MEMBERS = 30, MAX_JOINS_PER_MIN = 20, LOBBY = 'lobby';
 const TOK_RE = /^[A-Za-z0-9_-]{16,128}$/, CID_RE = /^[A-Za-z0-9_-]{1,40}$/, PUB_RE = /^p[0-9a-f]{20}$/;
 // fields only the room's host may publish (the game's lockstep host state)
@@ -36,6 +43,8 @@ const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; ch
 function start(o = {}) {
   const port = +o.port || 7420, host = o.host || undefined, password = o.password ? String(o.password) : '', game = o.game ? path.resolve(o.game) : null;
   const log = o.log || (m => console.log(new Date().toISOString(), m));
+  const store = o.store || null;
+  const acctTries = new Map();   // address -> sign-in times in the last hour
   const maxConns = +o.maxConnections || 300, maxPerIp = +o.maxPerAddress || 16, trustProxy = !!o.trustProxy;
   // the key that turns private tokens into public ids; new on every start unless KK_SECRET is set
   // Set it (KK_SECRET; on Render it is derived from the service) so players keep their IDs, and with them their seats,
@@ -54,7 +63,7 @@ function start(o = {}) {
   function serveHttp(req, res) {
     const hdr = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' };
     let u, rel; try { u = new URL(req.url, 'http://x'); rel = decodeURIComponent(u.pathname).replace(/^\/+/, ''); } catch (e) { res.writeHead(400, hdr); res.end(); return; }
-    if (rel === 'status') { res.writeHead(200, { ...hdr, 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify({ kageKami: true, version: VERSION, rooms: rooms.size, players: count(), game: !!game })); return; }
+    if (rel === 'status') { res.writeHead(200, { ...hdr, 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify({ kageKami: true, version: VERSION, rooms: rooms.size, players: count(), game: !!game, accounts: store ? store.kind : 'off' })); return; }
     if (!game) { res.writeHead(200, { ...hdr, 'content-type': 'text/plain' }); res.end('Kage Kami multiplayer server is running.\n'); return; }
     if (!rel) rel = 'index.html';
     const f = path.join(game, ...rel.split('/'));
@@ -62,7 +71,7 @@ function start(o = {}) {
     res.writeHead(200, { ...hdr, 'content-type': TYPES[path.extname(f).toLowerCase()] || 'application/octet-stream', 'cache-control': rel === 'manifest.json' || rel === 'index.html' ? 'no-store' : 'max-age=3600', 'access-control-allow-origin': '*' });
     fs.createReadStream(f).on('error', () => res.destroy()).pipe(res);
   }
-  const wss = new WebSocketServer({ server, maxPayload: 16 * 1024, perMessageDeflate: false });
+  const wss = new WebSocketServer({ server, maxPayload: 72 * 1024, perMessageDeflate: false });
   const count = () => wss.clients.size;
   const info = c => ({ peer: c.peer, by: c.by, name: c.name });
   // a client that stops reading (over 1 MiB waiting) is dropped instead of filling the server's memory
@@ -144,6 +153,7 @@ function start(o = {}) {
         send(ws, { t: 'welcome', peer: c.peer, by: c.by, v: VERSION }); return;
       }
       if (!c.ok) return;
+      if (m.t === 'acct' || m.t === 'save' || m.t === 'rank' || m.t === 'top') { account(c, m, now); return; }
       const r = typeof m.r === 'string' && ROOM_RE.test(m.r) ? m.r : null; if (!r) return;
       if (m.t === 'join') {
         if (c.rooms.has(r)) return; if (c.rooms.size >= MAX_ROOMS_PER_CLIENT) { send(ws, { t: 'err', r, m: 'Too many rooms.' }); return; }
@@ -167,6 +177,37 @@ function start(o = {}) {
         for (const o of room.members.values()) if (o !== c) send(o.ws, { t: 'p', r, ...info(c), p, at: now });
       } else if (m.t === 'leave') leave(c, r);
     };
+    // accounts: each request answered on its own; the database never holds up the room messages
+    function account(c, m, now) {
+      const q = typeof m.q === 'number' || typeof m.q === 'string' ? m.q : 0, reply = o => send(ws, { t: m.t, q, ...o });
+      if (!store) { reply({ off: true }); return; }
+      const fail = e => { log('Accounts: ' + (e && e.message)); reply({ err: 'The account service had a problem. Try again.' }); };
+      if (m.t === 'acct') {
+        const code = typeof m.code === 'string' ? m.code.trim().toUpperCase() : '';
+        if (!Store.CODE_RE.test(code)) { reply({ err: 'That account code is not valid.' }); return; }
+        const tries = (acctTries.get(addr) || []).filter(t => now - t < 3600000); if (tries.length >= 30) { reply({ err: 'Too many sign-ins from your address. Try later.' }); return; }
+        tries.push(now); acctTries.set(addr, tries);
+        const h = Store.hashCode(code);
+        store.touch(h).then(fresh => { c.acct = h; reply({ ok: true, me: Store.pubOf(h), fresh }); }, fail); return;
+      }
+      if (m.t === 'top') {
+        c.tops = (c.tops || []).filter(t => now - t < 10000); if (c.tops.length >= 6) { reply({ err: 'busy' }); return; } c.tops.push(now);
+        if (!Store.MODES.includes(m.mode)) { reply({ err: 'Unknown mode.' }); return; }
+        store.top(m.mode, 100).then(rows => reply({ mode: m.mode, rows: rows.map(r => ({ id: Store.pubOf(r.h), nm: r.nm, mode: r.mode, tier: r.tier, seals: r.seals, mmr: r.mmr, g: r.g, w: r.w, at: r.at })) }), fail); return;
+      }
+      if (!c.acct) { reply({ err: 'Not signed in.' }); return; }
+      if (m.t === 'save') {
+        if (m.d === undefined) { store.getSave(c.acct).then(d => reply({ d }), fail); return; }
+        if (now - (c.saveT || 0) < 1500) { reply({ err: 'busy' }); return; } c.saveT = now;
+        if (!m.d || typeof m.d !== 'object' || Array.isArray(m.d) || Buffer.byteLength(JSON.stringify(m.d)) > Store.MAX_SAVE) { reply({ err: 'That save is too big.' }); return; }
+        store.setSave(c.acct, m.d).then(() => reply({ ok: true }), fail); return;
+      }
+      if (m.t === 'rank') {
+        const row = Store.cleanRank(m.row); if (!row) { reply({ err: 'Bad ranked standing.' }); return; }
+        c.rankT = c.rankT || {}; if (now - (c.rankT[row.mode] || 0) < 1500) { reply({ err: 'busy' }); return; } c.rankT[row.mode] = now;
+        store.setRank(c.acct, row).then(() => reply({ ok: true }), fail); return;
+      }
+    }
     ws.on('close', () => { for (const r of [...c.rooms.keys()]) leave(c, r); const n = (perIp.get(addr) || 1) - 1; if (n > 0) perIp.set(addr, n); else perIp.delete(addr); });
     ws.on('error', () => {});
   });
@@ -189,10 +230,13 @@ if (require.main === module) {
   // on Render without KK_SECRET, a stable secret from the service's own id (the same on every deploy of this service)
   const secret = env.KK_SECRET || (env.RENDER_SERVICE_ID ? crypto.createHash('sha256').update('kagekami:' + env.RENDER_SERVICE_ID + ':' + (env.KK_PASSWORD || '')).digest('hex') : undefined);
   const log = m => console.log(new Date().toISOString(), m);
+  // accounts need a database: DATABASE_URL (Postgres, e.g. Neon's free plan or Render Postgres); KK_ACCOUNTS=memory for testing
+  const store = Store.open({ databaseUrl: env.DATABASE_URL, memory: env.KK_ACCOUNTS === 'memory', log });
+  const storeReady = store ? store.ready().then(() => { log('Accounts: ' + store.kind + ' store ready'); return store; }, e => { log('Accounts are off: the database did not answer (' + e.message + ')'); return null; }) : Promise.resolve(null);
   process.on('uncaughtException', e => log('Error (kept running): ' + (e && e.stack || e)));
   process.on('unhandledRejection', e => log('Error (kept running): ' + (e && e.stack || e)));
-  start({ port: get('port') || env.PORT, host: get('host') || env.KK_HOST, password: get('password') || env.KK_PASSWORD, game: get('game'), secret, log,
-    trustProxy: env.KK_TRUST_PROXY === '1' || env.RENDER === 'true', maxConnections: env.KK_MAX_CONNECTIONS, maxPerAddress: env.KK_MAX_PER_ADDRESS })
+  storeReady.then(store => start({ store, port: get('port') || env.PORT, host: get('host') || env.KK_HOST, password: get('password') || env.KK_PASSWORD, game: get('game'), secret, log,
+    trustProxy: env.KK_TRUST_PROXY === '1' || env.RENDER === 'true', maxConnections: env.KK_MAX_CONNECTIONS, maxPerAddress: env.KK_MAX_PER_ADDRESS }))
     .then(srv => {
       let down = false;
       const bye = () => { if (down) return; down = true; log('Shutting down: asking players to reconnect'); srv.drain(); setTimeout(() => srv.stop().then(() => process.exit(0)), 1500).unref(); setTimeout(() => process.exit(0), 5000).unref(); };

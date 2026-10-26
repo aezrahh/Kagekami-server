@@ -17,7 +17,7 @@ that waits up to a minute while it wakes (the game keeps retrying by itself).
   state (seats, the match, turns) and another player can take over only when the host is hidden or gone, and while a
   match is being set up or running only its players can join.
 - **Limits.** 16 connections per address, 300 in total, 30 members per room, 20 room joins a minute, 120 messages and
-  64 KiB a second per connection, and 10 minutes locked out after 5 wrong passwords.
+  96 KiB a second per connection, and 10 minutes locked out after 5 wrong passwords.
 - **Nothing about players is logged or stored.** Rooms, names and presence live in memory and vanish when a room empties.
   Addresses are held in memory only for the limits above.
 - **Encryption.** Render serves `wss://` for you. On your own server, use `install-linux.sh --domain` (Caddy and a free
@@ -34,7 +34,22 @@ that waits up to a minute while it wakes (the game keeps retrying by itself).
   guard; any other unexpected error is logged and the server keeps running.
 - **Slow clients are dropped** when more than 1 MiB is waiting to be sent to them, instead of filling the server's memory.
 
-Settings (environment variables): `KK_PASSWORD`, `PORT`, `KK_HOST` (address to listen on, for example `127.0.0.1` behind
+## Accounts and the ranked leaderboard (server 2.2)
+
+Optional, and on only when the server has a database. Players get an **anonymous account**: the launcher makes a random
+account code (like `KK-7F3Q-92XM-AB4C-DE5F`) and keeps it; there is no email and no password. The server stores only a
+SHA-256 of the code, plus the account's cloud save (64 KiB at most) and its ranked standing per mode. Writing the code
+down lets a player sign in on another computer. The leaderboard shows nicknames and short public ids, never the code.
+
+1. Make a Postgres database. Neon's free plan (neon.tech) doesn't expire; Render's own free Postgres is deleted after
+   30 days, its paid plan doesn't.
+2. Copy its connection address (`postgresql://…`) into the Render service's Environment as `DATABASE_URL` and save.
+   The server creates its tables (`kk_acct`, `kk_save`, `kk_rank`) by itself; `/status` then shows `"accounts":"postgres"`.
+
+Without `DATABASE_URL` everything works as before and each game keeps its saves and ranks on the player's computer.
+Ranked results are reported by the players' games, so a modified game could post a fake rank.
+
+Settings (environment variables): `DATABASE_URL` (accounts, above), `KK_PASSWORD`, `PORT`, `KK_HOST` (address to listen on, for example `127.0.0.1` behind
 Caddy), `KK_TRUST_PROXY=1` (on by itself on Render; set it behind another proxy that sets `X-Forwarded-For`), `KK_SECRET` (keeps player IDs
 the same across restarts, so matches survive them), `KK_MAX_CONNECTIONS`, `KK_MAX_PER_ADDRESS`.
 
