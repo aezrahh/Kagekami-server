@@ -14,6 +14,8 @@
 //   {t:"save", q} -> {t:"save", q, d}                   read the account's cloud save; with d: write it (64 KiB at most)
 //   {t:"rank", q, row} -> {t:"rank", q, ok}             this account's ranked standing in one mode (ffa or duel)
 //   {t:"top", q, mode} -> {t:"top", q, mode, rows}      the leaderboard: the top 100 of a mode, with short public ids
+//   {t:"kage", q, mode} -> {t:"kage", q, mode, rows, total}   the Top 500 Kage: Kage-rank players of a mode by seals,
+//                                                     then rating (also GET /kage?mode=duel, for web pages)
 //   With no database every reply is {t, q, off:true}, and the game keeps everything on the player's computer.
 //
 // Security and privacy (server 2.0):
@@ -30,7 +32,7 @@
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
-const VERSION = '2.2.1';
+const VERSION = '2.3.0';
 const Store = require('./store');
 const MAX_PRESENCE = 4096, MAX_ROOMS_PER_CLIENT = 4, MAX_MSGS_PER_SEC = 120, MAX_BYTES_PER_SEC = 96 * 1024, ROOM_RE = /^[a-z0-9-]{1,32}$/;
 const MAX_ROOM_MEMBERS = 30, MAX_JOINS_PER_MIN = 20, LOBBY = 'lobby';
@@ -44,6 +46,11 @@ function start(o = {}) {
   const port = +o.port || 7420, host = o.host || undefined, password = o.password ? String(o.password) : '', game = o.game ? path.resolve(o.game) : null;
   const log = o.log || (m => console.log(new Date().toISOString(), m));
   const store = o.store || null;
+  const pubRow = r => ({ id: Store.pubOf(r.h), nm: r.nm, mode: r.mode, tier: r.tier, seals: r.seals, mmr: r.mmr, g: r.g, w: r.w, at: r.at });
+  // the Top 500 Kage of a mode, kept for 30 s so many players opening it make one database read
+  const kageC = new Map();
+  const kageList = mode => { const c = kageC.get(mode); if (c && Date.now() - c.at < 30000) return c.p;
+    const p = store.kage(mode, Store.KAGE_TOP).then(k => ({ rows: k.rows.map(pubRow), total: k.total })); p.catch(() => kageC.delete(mode)); kageC.set(mode, { at: Date.now(), p }); return p; };
   const acctTries = new Map();   // address -> Map(account hash -> last sign-in time), the last hour
   const maxConns = +o.maxConnections || 300, maxPerIp = +o.maxPerAddress || 16, trustProxy = !!o.trustProxy;
   // the key that turns private tokens into public ids; new on every start unless KK_SECRET is set
@@ -65,6 +72,12 @@ function start(o = {}) {
     const hdr = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' };
     let u, rel; try { u = new URL(req.url, 'http://x'); rel = decodeURIComponent(u.pathname).replace(/^\/+/, ''); } catch (e) { res.writeHead(400, hdr); res.end(); return; }
     if (rel === 'status') { res.writeHead(200, { ...hdr, 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify({ kageKami: true, version: VERSION, rooms: rooms.size, players: count(), game: !!game, accounts: store ? store.kind : 'off' })); return; }
+    if (rel === 'kage') {   // the Top 500 Kage, read-only and public (names and short public ids only)
+      const mode = u.searchParams.get('mode') || 'duel', J = (code, o) => { res.writeHead(code, { ...hdr, 'content-type': 'application/json', 'access-control-allow-origin': '*', 'cache-control': 'max-age=30' }); res.end(JSON.stringify(o)); };
+      if (!store) return J(200, { off: true });
+      if (!Store.MODES.includes(mode)) return J(400, { err: 'Unknown mode.' });
+      kageList(mode).then(k => J(200, { mode, ...k }), e => { log('Accounts: ' + (e && e.message)); J(500, { err: 'The account service had a problem.' }); }); return;
+    }
     if (!game) { res.writeHead(200, { ...hdr, 'content-type': 'text/plain' }); res.end('Kage Kami multiplayer server is running.\n'); return; }
     if (!rel) rel = 'index.html';
     const f = path.join(game, ...rel.split('/'));
@@ -154,7 +167,7 @@ function start(o = {}) {
         send(ws, { t: 'welcome', peer: c.peer, by: c.by, v: VERSION }); return;
       }
       if (!c.ok) return;
-      if (m.t === 'acct' || m.t === 'save' || m.t === 'rank' || m.t === 'top') { account(c, m, now); return; }
+      if (m.t === 'acct' || m.t === 'save' || m.t === 'rank' || m.t === 'top' || m.t === 'kage') { account(c, m, now); return; }
       const r = typeof m.r === 'string' && ROOM_RE.test(m.r) ? m.r : null; if (!r) return;
       if (m.t === 'join') {
         if (c.rooms.has(r)) return; if (c.rooms.size >= MAX_ROOMS_PER_CLIENT) { send(ws, { t: 'err', r, m: 'Too many rooms.' }); return; }
@@ -194,10 +207,11 @@ function start(o = {}) {
         tries.set(h, now); acctTries.set(addr, tries);
         store.touch(h).then(fresh => { c.acct = h; reply({ ok: true, me: Store.pubOf(h), fresh }); }, fail); return;
       }
-      if (m.t === 'top') {
+      if (m.t === 'top' || m.t === 'kage') {
         c.tops = (c.tops || []).filter(t => now - t < 10000); if (c.tops.length >= 6) { reply({ err: 'busy' }); return; } c.tops.push(now);
         if (!Store.MODES.includes(m.mode)) { reply({ err: 'Unknown mode.' }); return; }
-        store.top(m.mode, 100).then(rows => reply({ mode: m.mode, rows: rows.map(r => ({ id: Store.pubOf(r.h), nm: r.nm, mode: r.mode, tier: r.tier, seals: r.seals, mmr: r.mmr, g: r.g, w: r.w, at: r.at })) }), fail); return;
+        if (m.t === 'kage') { kageList(m.mode).then(k => reply({ mode: m.mode, ...k }), fail); return; }
+        store.top(m.mode, 100).then(rows => reply({ mode: m.mode, rows: rows.map(pubRow) }), fail); return;
       }
       if (!c.acct) { reply({ err: 'Not signed in.' }); return; }
       if (m.t === 'save') {

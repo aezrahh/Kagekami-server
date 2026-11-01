@@ -43,10 +43,33 @@ async function run(label, store, port) {
   r = await A2.ask({ t: 'acct', code: codeA }); ok(r && r.ok, label + ': a known account still signs in after the limit');
   for (const c of [A, B, A2]) c.ws.close(); await srv.stop();
 }
+// the Top 500 Kage: only Kage-rank rows, by seals then rating, capped at 500, over WebSocket and HTTP
+async function kage(label, store, port, many) {
+  const srv = await start({ port, store, log: () => {} }); const U = 'ws://127.0.0.1:' + port;
+  const rows = [['KK-KAGA-AAAA-BBBB-CCCC', 5, 50, 1600], ['KK-KAGB-AAAA-BBBB-CCCC', 5, 50, 1700], ['KK-KAGC-AAAA-BBBB-CCCC', 5, 120, 1550], ['KK-KAGD-AAAA-BBBB-CCCC', 4, 99, 1500], ['KK-KAGE-AAAA-BBBB-CCCC', 30, 200, 1400]];
+  const me = [];
+  for (const [code, tier, seals, mmr] of rows) { const c = client(U); await c.ready; await sleep(30); const a = await c.ask({ t: 'acct', code }); me.push(a && a.me);
+    await c.ask({ t: 'rank', row: { mode: 'duel', nm: 'K' + me.length, tier, seals, mmr, g: 200, w: 150 } }); c.ws.close(); }
+  if (many) for (let i = 0; i < 510; i++) await store.setRank('fake' + i, { mode: 'duel', nm: 'F' + i, tier: 5, seals: i % 50, mmr: 1550, g: 100, w: 60, at: Date.now() });
+  const C = client(U); await C.ready; await sleep(30);
+  let r = await C.ask({ t: 'kage', mode: 'duel' });
+  const ours = r && r.rows ? r.rows.filter(x => me.includes(x.id)).map(x => x.nm) : [];
+  ok(r && r.rows && ours.join() === 'K5,K3,K2,K1' && r.rows.every(x => x.tier === 5), label + ': Top Kage has only Kage rows, by seals then rating (' + ours.join() + ')');
+  ok(r && r.rows && r.rows.find(x => x.nm === 'K5').tier === 5, label + ': an impossible rank is held to Kage');
+  ok(r && r.rows && !JSON.stringify(r).includes('KK-KAG') && r.rows.every(x => /^a[0-9a-f]{12}$/.test(x.id)), label + ': Top Kage shows public ids only');
+  if (many) ok(r.rows.length === 500 && r.total === 514, label + ': capped at 500 of ' + r.total);
+  r = await C.ask({ t: 'kage', mode: 'chess' }); ok(r && r.err, label + ': Top Kage refuses an unknown mode');
+  const h = await fetch('http://127.0.0.1:' + port + '/kage?mode=duel').then(x => x.json()).catch(() => null);
+  ok(h && h.rows && h.rows.filter(x => me.includes(x.id)).map(x => x.nm).join() === 'K5,K3,K2,K1', label + ': GET /kage gives the same list');
+  const bad = await fetch('http://127.0.0.1:' + port + '/kage?mode=x').then(x => x.status); ok(bad === 400, label + ': GET /kage refuses an unknown mode');
+  C.ws.close(); await srv.stop();
+}
 (async () => {
   await run('memory', Store.open({ memory: true }), 7541);
+  await kage('memory', Store.open({ memory: true }), 7544, true);
   const off = await start({ port: 7542, log: () => {} }); const C = client('ws://127.0.0.1:7542'); await C.ready; await sleep(50);
-  const r = await C.ask({ t: 'acct', code: 'KK-AB2C-DE3F-GH4J-KM5N' }); ok(r && r.off === true, 'no database: accounts off'); C.ws.close(); await off.stop();
-  if (process.env.KK_TEST_PG) { const pg = Store.open({ databaseUrl: process.env.KK_TEST_PG }); await pg.ready(); await run('postgres', pg, 7543); await pg.close(); }
+  const r = await C.ask({ t: 'acct', code: 'KK-AB2C-DE3F-GH4J-KM5N' }); ok(r && r.off === true, 'no database: accounts off');
+  const k = await C.ask({ t: 'kage', mode: 'duel' }); ok(k && k.off === true, 'no database: Top Kage off'); C.ws.close(); await off.stop();
+  if (process.env.KK_TEST_PG) { const pg = Store.open({ databaseUrl: process.env.KK_TEST_PG }); await pg.ready(); await run('postgres', pg, 7543); await kage('postgres', pg, 7545, false); await pg.close(); }
   console.log(fails ? fails + ' failed' : 'all passed'); process.exit(fails ? 1 : 0);
 })();

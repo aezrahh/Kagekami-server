@@ -49,6 +49,13 @@ down lets a player sign in on another computer. The leaderboard shows nicknames 
 Without `DATABASE_URL` everything works as before and each game keeps its saves and ranks on the player's computer.
 Ranked results are reported by the players' games, so a modified game could post a fake rank.
 
+## Top 500 Kage (server 2.3)
+
+The players at the top rank, Kage, get their own list: the 500 best of each ranked mode (`ffa` Five Villages, `duel` Two
+Villages), ordered by Mission Seals and then rating, with the same names and short public ids as the leaderboard. Games
+ask for it with `{t:"kage", mode}`; web pages can read `GET /kage?mode=duel` (read-only, kept for 30 seconds). Ranks
+above Kage can't be posted any more: a row is held to Kage at most.
+
 Settings (environment variables): `DATABASE_URL` (accounts, above), `KK_PASSWORD`, `PORT`, `KK_HOST` (address to listen on, for example `127.0.0.1` behind
 Caddy), `KK_TRUST_PROXY=1` (on by itself on Render; set it behind another proxy that sets `X-Forwarded-For`), `KK_SECRET` (keeps player IDs
 the same across restarts, so matches survive them), `KK_MAX_CONNECTIONS`, `KK_MAX_PER_ADDRESS`.

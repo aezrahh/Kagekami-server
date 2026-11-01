@@ -4,6 +4,8 @@
 // Render Postgres) and memory (for tests and local play; forgotten on restart).
 const crypto = require('crypto');
 const MODES = ['ffa', 'duel'], MAX_SAVE = 64 * 1024;
+// the game's ranks: 0 Academy Student ... 5 Kage (RK_TIERS); -1 is unranked (still in placements)
+const KAGE = 5, KAGE_TOP = 500;
 
 function memory() {
   const acct = new Map(), save = new Map(), rank = new Map();
@@ -15,6 +17,7 @@ function memory() {
     async setSave(h, d) { save.set(h, JSON.stringify(d)); },
     async setRank(h, row) { rank.set(h + ':' + row.mode, { h, ...row }); },
     async top(mode, n) { return [...rank.values()].filter(r => r.mode === mode).sort(order).slice(0, n); },
+    async kage(mode, n) { const all = [...rank.values()].filter(r => r.mode === mode && r.tier === KAGE).sort(order); return { rows: all.slice(0, n), total: all.length }; },
     async counts() { return { accounts: acct.size, ranked: rank.size }; },
     async close() {},
   };
@@ -44,6 +47,10 @@ function postgres(url, log) {
         ON CONFLICT (h, mode) DO UPDATE SET nm=$3, tier=$4, seals=$5, mmr=$6, g=$7, w=$8, at=$9`, [h, r.mode, r.nm, r.tier, r.seals, r.mmr, r.g, r.w, r.at]); },
     async top(mode, n) { const r = await q(`SELECT h, mode, nm, tier, seals, mmr, g, w, at FROM kk_rank WHERE mode = $1 ORDER BY (tier >= 0) DESC, tier DESC, seals DESC, mmr DESC LIMIT $2`, [mode, n]);
       return r.rows.map(x => ({ ...x, at: +x.at })); },
+    async kage(mode, n) {
+      const r = await q(`SELECT h, mode, nm, tier, seals, mmr, g, w, at FROM kk_rank WHERE mode = $1 AND tier = $2 ORDER BY seals DESC, mmr DESC LIMIT $3`, [mode, KAGE, n]);
+      const c = await q(`SELECT count(*) n FROM kk_rank WHERE mode = $1 AND tier = $2`, [mode, KAGE]);
+      return { rows: r.rows.map(x => ({ ...x, at: +x.at })), total: +c.rows[0].n }; },
     async counts() { const a = await q(`SELECT (SELECT count(*) FROM kk_acct) a, (SELECT count(*) FROM kk_rank) r`); return { accounts: +a.rows[0].a, ranked: +a.rows[0].r }; },
     async close() { await pool.end(); },
   };
@@ -59,7 +66,7 @@ const cleanName = s => String(s || '').replace(/[\u0000-\u001f\u007f<>]/g, '').t
 function cleanRank(m) {
   if (!m || typeof m !== 'object' || !MODES.includes(m.mode)) return null;
   const g = clampInt(m.g, 0, 100000), w = clampInt(m.w, 0, g);
-  return { mode: m.mode, nm: cleanName(m.nm), tier: clampInt(m.tier, -1, 30), seals: clampInt(m.seals, 0, 100000), mmr: clampInt(m.mmr, 0, 10000), g, w, at: Date.now() };
+  return { mode: m.mode, nm: cleanName(m.nm), tier: clampInt(m.tier, -1, KAGE), seals: clampInt(m.seals, 0, 100000), mmr: clampInt(m.mmr, 0, 10000), g, w, at: Date.now() };
 }
 
 function open(o = {}) {
@@ -68,4 +75,4 @@ function open(o = {}) {
   if (o.memory) return memory();
   return null;
 }
-module.exports = { open, CODE_RE, hashCode, pubOf, cleanRank, cleanName, MODES, MAX_SAVE };
+module.exports = { open, CODE_RE, hashCode, pubOf, cleanRank, cleanName, MODES, MAX_SAVE, KAGE, KAGE_TOP };
