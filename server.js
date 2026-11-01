@@ -30,7 +30,7 @@
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
-const VERSION = '2.2.0';
+const VERSION = '2.2.1';
 const Store = require('./store');
 const MAX_PRESENCE = 4096, MAX_ROOMS_PER_CLIENT = 4, MAX_MSGS_PER_SEC = 120, MAX_BYTES_PER_SEC = 96 * 1024, ROOM_RE = /^[a-z0-9-]{1,32}$/;
 const MAX_ROOM_MEMBERS = 30, MAX_JOINS_PER_MIN = 20, LOBBY = 'lobby';
@@ -44,7 +44,7 @@ function start(o = {}) {
   const port = +o.port || 7420, host = o.host || undefined, password = o.password ? String(o.password) : '', game = o.game ? path.resolve(o.game) : null;
   const log = o.log || (m => console.log(new Date().toISOString(), m));
   const store = o.store || null;
-  const acctTries = new Map();   // address -> sign-in times in the last hour
+  const acctTries = new Map();   // address -> Map(account hash -> last sign-in time), the last hour
   const maxConns = +o.maxConnections || 300, maxPerIp = +o.maxPerAddress || 16, trustProxy = !!o.trustProxy;
   // the key that turns private tokens into public ids; new on every start unless KK_SECRET is set
   // Set it (KK_SECRET; on Render it is derived from the service) so players keep their IDs, and with them their seats,
@@ -57,7 +57,8 @@ function start(o = {}) {
   const rooms = new Map();   // name -> { members: Map(peer -> client), host: peer | null }
   const perIp = new Map();   // address -> open connections
   const fails = new Map();   // address -> { n, until }: wrong passwords
-  const sweep = setInterval(() => { const now = Date.now(); for (const [k, f] of fails) if (f.until < now && now - f.at > 600000) fails.delete(k); }, 60000);
+  const sweep = setInterval(() => { const now = Date.now(); for (const [k, f] of fails) if (f.until < now && now - f.at > 600000) fails.delete(k);
+    for (const [a, m] of acctTries) { for (const [h, t] of m) if (now - t >= 3600000) m.delete(h); if (!m.size) acctTries.delete(a); } }, 60000);
 
   const server = http.createServer((req, res) => { try { serveHttp(req, res); } catch (e) { log('HTTP error: ' + (e && e.message)); try { res.writeHead(500); res.end(); } catch (x) {} } });
   function serveHttp(req, res) {
@@ -185,9 +186,12 @@ function start(o = {}) {
       if (m.t === 'acct') {
         const code = typeof m.code === 'string' ? m.code.trim().toUpperCase() : '';
         if (!Store.CODE_RE.test(code)) { reply({ err: 'That account code is not valid.' }); return; }
-        const tries = (acctTries.get(addr) || []).filter(t => now - t < 3600000); if (tries.length >= 30) { reply({ err: 'Too many sign-ins from your address. Try later.' }); return; }
-        tries.push(now); acctTries.set(addr, tries);
+        // at most 30 different accounts an hour from one address; the same account signing in again (every reconnect
+        // does) doesn't count, so players behind one address and flaky connections keep their ranked board
         const h = Store.hashCode(code);
+        const tries = acctTries.get(addr) || new Map(); for (const [k, t] of tries) if (now - t >= 3600000) tries.delete(k);
+        if (!tries.has(h) && tries.size >= 30) { reply({ err: 'Too many sign-ins from your address. Try later.' }); return; }
+        tries.set(h, now); acctTries.set(addr, tries);
         store.touch(h).then(fresh => { c.acct = h; reply({ ok: true, me: Store.pubOf(h), fresh }); }, fail); return;
       }
       if (m.t === 'top') {

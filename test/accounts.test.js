@@ -35,6 +35,12 @@ async function run(label, store, port) {
   const A2 = client(U); await A2.ready; await sleep(50);
   r = await A2.ask({ t: 'acct', code: codeA.toLowerCase() }); ok(r && r.ok && r.fresh === false && r.me === meA, label + ': sign back in (any case)');
   r = await A2.ask({ t: 'save' }); ok(r && r.d && r.d.t === 5 && r.d.data['kr-ryo'] === '{"r":10}', label + ': save follows the account');
+  // reconnecting with the same code never runs into the sign-in limit; 30 different accounts from one address do
+  let same = true; for (let i = 0; i < 40; i++) { const x = await A2.ask({ t: 'acct', code: codeA }); if (!x || !x.ok) { same = false; break; } }
+  ok(same, label + ': the same account can sign in again and again');
+  let blocked = null; for (let i = 0; i < 31 && !blocked; i++) { const x = await A2.ask({ t: 'acct', code: 'KK-' + ('AAAA-BBBB-CCCC-' + 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[i] + 'DDD').slice(0) }); if (x && x.err) blocked = i; }
+  ok(blocked === 28, label + ': 30 different accounts an hour per address');   // codeA and codeB came from this address too
+  r = await A2.ask({ t: 'acct', code: codeA }); ok(r && r.ok, label + ': a known account still signs in after the limit');
   for (const c of [A, B, A2]) c.ws.close(); await srv.stop();
 }
 (async () => {
