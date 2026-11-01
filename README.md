@@ -56,6 +56,14 @@ Villages), ordered by Mission Seals and then rating, with the same names and sho
 ask for it with `{t:"kage", mode}`; web pages can read `GET /kage?mode=duel` (read-only, kept for 30 seconds). Ranks
 above Kage can't be posted any more: a row is held to Kage at most.
 
+## Village War (server 2.4)
+
+A weekly server-wide score: every signed-in player's online match adds a game, and a win when they won, to their
+village (`leaf`, `sand`, `mist`, `cloud`, `stone`). Games send `{t:"vw", v, win}` when an online match ends and read
+`{t:"vwar"}` for this week's and last week's totals (`GET /vwar` for web pages, kept for 30 seconds). Weeks are ISO weeks
+in UTC, starting on Monday. To keep one player from swinging it, an account adds at most 40 results a week and at most one
+every 10 minutes. Only village totals are public; nothing ties a result to a player.
+
 Settings (environment variables): `DATABASE_URL` (accounts, above), `KK_PASSWORD`, `PORT`, `KK_HOST` (address to listen on, for example `127.0.0.1` behind
 Caddy), `KK_TRUST_PROXY=1` (on by itself on Render; set it behind another proxy that sets `X-Forwarded-For`), `KK_SECRET` (keeps player IDs
 the same across restarts, so matches survive them), `KK_MAX_CONNECTIONS`, `KK_MAX_PER_ADDRESS`.

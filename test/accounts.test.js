@@ -64,12 +64,34 @@ async function kage(label, store, port, many) {
   const bad = await fetch('http://127.0.0.1:' + port + '/kage?mode=x').then(x => x.status); ok(bad === 400, label + ': GET /kage refuses an unknown mode');
   C.ws.close(); await srv.stop();
 }
+// Village War: signed-in accounts add online results by village; capped per account; public totals over WS and HTTP
+async function vwar(label, store, port) {
+  const srv = await start({ port, store, log: () => {} }); const U = 'ws://127.0.0.1:' + port;
+  const A = client(U), B = client(U); await A.ready; await B.ready; await sleep(60);
+  let r = await A.ask({ t: 'vw', v: 'leaf', win: true }); ok(r && /Not signed in/.test(r.err), label + ': Village War needs sign-in');
+  await A.ask({ t: 'acct', code: 'KK-VWAA-AAAA-BBBB-CCCC' }); await B.ask({ t: 'acct', code: 'KK-VWBB-AAAA-BBBB-CCCC' });
+  r = await A.ask({ t: 'vw', v: 'leaf', win: true }); ok(r && r.ok && r.counted === true, label + ': a result counts');
+  r = await A.ask({ t: 'vw', v: 'leaf', win: true }); ok(r && r.ok && r.counted === false, label + ': a second result within 10 minutes does not');
+  r = await B.ask({ t: 'vw', v: 'sand', win: false }); ok(r && r.counted === true, label + ': another account counts');
+  r = await B.ask({ t: 'vw', v: 'konoha', win: true }); ok(r && r.err, label + ': unknown village refused');
+  r = await B.ask({ t: 'vw', v: 'mist', win: 'yes' }); ok(r && r.err, label + ': win must be true or false');
+  r = await A.ask({ t: 'vwar' }); const g = v => r && r.rows && r.rows.find(x => x.v === v);
+  ok(r && r.wk === Store.weekOf() && r.rows.length === 5 && g('leaf').w === 1 && g('leaf').g === 1 && g('sand').w === 0 && g('sand').g === 1 && r.prev.length === 5, label + ': weekly totals');
+  // the weekly cap: 40 results, ten minutes apart
+  await store.touch('cap'); let n = 0; for (let i = 0; i < 45; i++) if (await store.addVW('cap', '2026-W10', 'mist', true, 1e12 + i * Store.VW_GAP)) n++;
+  ok(n === Store.VW_MAX, label + ': at most ' + Store.VW_MAX + ' results an account a week (' + n + ')');
+  const h = await fetch('http://127.0.0.1:' + port + '/vwar').then(x => x.json()).catch(() => null);
+  ok(h && h.rows && h.rows.length === 5 && !JSON.stringify(h).includes('VWAA'), label + ': GET /vwar gives village totals only');
+  A.ws.close(); B.ws.close(); await srv.stop();
+}
 (async () => {
   await run('memory', Store.open({ memory: true }), 7541);
   await kage('memory', Store.open({ memory: true }), 7544, true);
+  await vwar('memory', Store.open({ memory: true }), 7546);
   const off = await start({ port: 7542, log: () => {} }); const C = client('ws://127.0.0.1:7542'); await C.ready; await sleep(50);
   const r = await C.ask({ t: 'acct', code: 'KK-AB2C-DE3F-GH4J-KM5N' }); ok(r && r.off === true, 'no database: accounts off');
-  const k = await C.ask({ t: 'kage', mode: 'duel' }); ok(k && k.off === true, 'no database: Top Kage off'); C.ws.close(); await off.stop();
-  if (process.env.KK_TEST_PG) { const pg = Store.open({ databaseUrl: process.env.KK_TEST_PG }); await pg.ready(); await run('postgres', pg, 7543); await kage('postgres', pg, 7545, false); await pg.close(); }
+  const k = await C.ask({ t: 'kage', mode: 'duel' }); ok(k && k.off === true, 'no database: Top Kage off');
+  const vw = await C.ask({ t: 'vwar' }); ok(vw && vw.off === true, 'no database: Village War off'); C.ws.close(); await off.stop();
+  if (process.env.KK_TEST_PG) { const pg = Store.open({ databaseUrl: process.env.KK_TEST_PG }); await pg.ready(); await run('postgres', pg, 7543); await kage('postgres', pg, 7545, false); await vwar('postgres', pg, 7547); await pg.close(); }
   console.log(fails ? fails + ' failed' : 'all passed'); process.exit(fails ? 1 : 0);
 })();
