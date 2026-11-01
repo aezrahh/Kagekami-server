@@ -19,8 +19,8 @@
 //   {t:"vw", q, v, win} -> {t:"vw", q, ok, counted}     Village War (2.4): this account's village (leaf, sand, mist, cloud,
 //                                                     stone) and whether it won an online match; at most 40 a week, one
 //                                                     every 10 minutes per account (counted:false past that)
-//   {t:"vwar", q} -> {t:"vwar", q, wk, rows, prev}      this week's and last week's Village War: [{v, w, g}] per village
-//                                                     (also GET /vwar, for web pages)
+//   {t:"vwar", q} -> {t:"vwar", q, wk, rows, pw, prev}  this week's and last week's Village War: [{v, w, g}] per village;
+//                                                     wk and pw are the ISO weeks of rows and prev (also GET /vwar)
 //   With no database every reply is {t, q, off:true}, and the game keeps everything on the player's computer.
 //
 // Security and privacy (server 2.0):

@@ -80,6 +80,11 @@ async function vwar(label, store, port) {
   // the weekly cap: 40 results, ten minutes apart
   await store.touch('cap'); let n = 0; for (let i = 0; i < 45; i++) if (await store.addVW('cap', '2026-W10', 'mist', true, 1e12 + i * Store.VW_GAP)) n++;
   ok(n === Store.VW_MAX, label + ': at most ' + Store.VW_MAX + ' results an account a week (' + n + ')');
+  const t1 = 1e12 + 45 * Store.VW_GAP;
+  ok(await store.addVW('cap', '2026-W11', 'mist', false, t1), label + ': a new week starts the count again');
+  ok(!(await store.addVW('cap', '2026-W12', 'mist', false, t1 + 1000)), label + ': the 10-minute gap holds across a week change');
+  const w11 = (await store.getVW('2026-W11')).find(x => x.v === 'mist'), w10 = (await store.getVW('2026-W10')).find(x => x.v === 'mist');
+  ok(w11.g === 1 && w11.w === 0 && w10.g === Store.VW_MAX && w10.w === Store.VW_MAX, label + ': village totals match the counted results');
   const h = await fetch('http://127.0.0.1:' + port + '/vwar').then(x => x.json()).catch(() => null);
   ok(h && h.rows && h.rows.length === 5 && !JSON.stringify(h).includes('VWAA'), label + ': GET /vwar gives village totals only');
   A.ws.close(); B.ws.close(); await srv.stop();

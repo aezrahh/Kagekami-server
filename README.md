@@ -38,13 +38,14 @@ that waits up to a minute while it wakes (the game keeps retrying by itself).
 
 Optional, and on only when the server has a database. Players get an **anonymous account**: the launcher makes a random
 account code (like `KK-7F3Q-92XM-AB4C-DE5F`) and keeps it; there is no email and no password. The server stores only a
-SHA-256 of the code, plus the account's cloud save (64 KiB at most) and its ranked standing per mode. Writing the code
+SHA-256 of the code, plus the account's cloud save (64 KiB at most), its ranked standing per mode and, for Village War, how many results it
+added this week and when the last one came (one row per account, replaced each week; no older weeks are kept). Writing the code
 down lets a player sign in on another computer. The leaderboard shows nicknames and short public ids, never the code.
 
 1. Make a Postgres database. Neon's free plan (neon.tech) doesn't expire; Render's own free Postgres is deleted after
    30 days, its paid plan doesn't.
 2. Copy its connection address (`postgresql://…`) into the Render service's Environment as `DATABASE_URL` and save.
-   The server creates its tables (`kk_acct`, `kk_save`, `kk_rank`) by itself; `/status` then shows `"accounts":"postgres"`.
+   The server creates its tables (`kk_acct`, `kk_save`, `kk_rank`, and `kk_vw`, `kk_vwa` for Village War) by itself; `/status` then shows `"accounts":"postgres"`.
 
 Without `DATABASE_URL` everything works as before and each game keeps its saves and ranks on the player's computer.
 Ranked results are reported by the players' games, so a modified game could post a fake rank.
