@@ -6,9 +6,18 @@ const crypto = require('crypto');
 const MODES = ['ffa', 'duel'], MAX_SAVE = 64 * 1024;
 // the game's ranks: 0 Academy Student ... 5 Kage (RK_TIERS); -1 is unranked (still in placements)
 const KAGE = 5, KAGE_TOP = 500;
+// Village War (server 2.4): a weekly server-wide score of online matches by village; each account adds at most VW_MAX
+// results a week, and at most one every VW_GAP ms (an online match lasts longer than that)
+const VILLAGES = ['leaf', 'sand', 'mist', 'cloud', 'stone'], VW_MAX = 40, VW_GAP = 10 * 60 * 1000;
+// ISO week of a time, as "2026-W44" (weeks start on Monday, UTC)
+function weekOf(t = Date.now()) {
+  const d = new Date(t), day = (d.getUTCDay() + 6) % 7, th = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - day + 3));
+  const y = th.getUTCFullYear(), w1 = new Date(Date.UTC(y, 0, 4)), wk = 1 + Math.round(((th - w1) / 864e5 - 3 + ((w1.getUTCDay() + 6) % 7)) / 7);
+  return y + '-W' + String(wk).padStart(2, '0');
+}
 
 function memory() {
-  const acct = new Map(), save = new Map(), rank = new Map();
+  const acct = new Map(), save = new Map(), rank = new Map(), vw = new Map(), vwa = new Map();
   return {
     kind: 'memory',
     async ready() {},
@@ -19,6 +28,10 @@ function memory() {
     async top(mode, n) { return [...rank.values()].filter(r => r.mode === mode).sort(order).slice(0, n); },
     async kage(mode, n) { const all = [...rank.values()].filter(r => r.mode === mode && r.tier === KAGE).sort(order); return { rows: all.slice(0, n), total: all.length }; },
     async counts() { return { accounts: acct.size, ranked: rank.size }; },
+    // one row per account for the current week only (a new week starts the count again), so no history is kept
+    async addVW(h, wk, v, win, now) { const a = vwa.get(h), n = a && a.wk === wk ? a.n : 0; if (n >= VW_MAX || (a && now - a.at < VW_GAP)) return false;
+      vwa.set(h, { wk, n: n + 1, at: now }); const s = vw.get(wk + ':' + v) || { w: 0, g: 0 }; vw.set(wk + ':' + v, { w: s.w + (win ? 1 : 0), g: s.g + 1 }); return true; },
+    async getVW(wk) { return VILLAGES.map(v => ({ v, ...(vw.get(wk + ':' + v) || { w: 0, g: 0 }) })); },
     async close() {},
   };
 }
@@ -39,6 +52,8 @@ function postgres(url, log) {
       await q(`CREATE TABLE IF NOT EXISTS kk_rank (h text NOT NULL REFERENCES kk_acct(h) ON DELETE CASCADE, mode text NOT NULL, nm text NOT NULL, tier int NOT NULL, seals int NOT NULL,
         mmr int NOT NULL, g int NOT NULL, w int NOT NULL, at bigint NOT NULL, PRIMARY KEY (h, mode))`);
       await q(`CREATE INDEX IF NOT EXISTS kk_rank_order ON kk_rank (mode, (tier >= 0) DESC, tier DESC, seals DESC, mmr DESC)`);
+      await q(`CREATE TABLE IF NOT EXISTS kk_vw (wk text NOT NULL, v text NOT NULL, w int NOT NULL, g int NOT NULL, PRIMARY KEY (wk, v))`);
+      await q(`CREATE TABLE IF NOT EXISTS kk_vwa (h text PRIMARY KEY REFERENCES kk_acct(h) ON DELETE CASCADE, wk text NOT NULL, n int NOT NULL, at bigint NOT NULL)`);
     },
     async touch(h) { const now = Date.now(); const r = await q(`INSERT INTO kk_acct (h, at, seen) VALUES ($1, $2, $2) ON CONFLICT (h) DO UPDATE SET seen = $2 RETURNING (xmax = 0) AS fresh`, [h, now]); return !!r.rows[0].fresh; },
     async getSave(h) { const r = await q(`SELECT d FROM kk_save WHERE h = $1`, [h]); return r.rows[0] ? r.rows[0].d : null; },
@@ -52,6 +67,17 @@ function postgres(url, log) {
       const c = await q(`SELECT count(*) n FROM kk_rank WHERE mode = $1 AND tier = $2`, [mode, KAGE]);
       return { rows: r.rows.map(x => ({ ...x, at: +x.at })), total: +c.rows[0].n }; },
     async counts() { const a = await q(`SELECT (SELECT count(*) FROM kk_acct) a, (SELECT count(*) FROM kk_rank) r`); return { accounts: +a.rows[0].a, ranked: +a.rows[0].r }; },
+    // one statement does it all: claims the account's slot (cap, gap and week checked in the database; kk_vwa holds one
+    // row per account, reset when the week changes, so no weekly history is kept) and adds to the village's count
+    async addVW(h, wk, v, win, now) {
+      const r = await q(`WITH c AS (INSERT INTO kk_vwa (h, wk, n, at) VALUES ($1, $2, 1, $3) ON CONFLICT (h) DO UPDATE
+          SET n = CASE WHEN kk_vwa.wk = $2 THEN kk_vwa.n + 1 ELSE 1 END, wk = $2, at = $3
+          WHERE $3 - kk_vwa.at >= $5 AND (kk_vwa.wk <> $2 OR kk_vwa.n < $4) RETURNING n)
+        INSERT INTO kk_vw (wk, v, w, g) SELECT $2, $6, $7, 1 FROM c ON CONFLICT (wk, v) DO UPDATE SET w = kk_vw.w + EXCLUDED.w, g = kk_vw.g + 1
+        RETURNING 1`, [h, wk, now, VW_MAX, VW_GAP, v, win ? 1 : 0]);
+      return r.rows.length > 0; },
+    async getVW(wk) { const r = await q(`SELECT v, w, g FROM kk_vw WHERE wk = $1`, [wk]); const m = new Map(r.rows.map(x => [x.v, x]));
+      return VILLAGES.map(v => ({ v, w: m.has(v) ? +m.get(v).w : 0, g: m.has(v) ? +m.get(v).g : 0 })); },
     async close() { await pool.end(); },
   };
 }
@@ -75,4 +101,4 @@ function open(o = {}) {
   if (o.memory) return memory();
   return null;
 }
-module.exports = { open, CODE_RE, hashCode, pubOf, cleanRank, cleanName, MODES, MAX_SAVE, KAGE, KAGE_TOP };
+module.exports = { open, CODE_RE, hashCode, pubOf, cleanRank, cleanName, MODES, MAX_SAVE, KAGE, KAGE_TOP, VILLAGES, VW_MAX, VW_GAP, weekOf };

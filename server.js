@@ -16,6 +16,11 @@
 //   {t:"top", q, mode} -> {t:"top", q, mode, rows}      the leaderboard: the top 100 of a mode, with short public ids
 //   {t:"kage", q, mode} -> {t:"kage", q, mode, rows, total}   the Top 500 Kage: Kage-rank players of a mode by seals,
 //                                                     then rating (also GET /kage?mode=duel, for web pages)
+//   {t:"vw", q, v, win} -> {t:"vw", q, ok, counted}     Village War (2.4): this account's village (leaf, sand, mist, cloud,
+//                                                     stone) and whether it won an online match; at most 40 a week, one
+//                                                     every 10 minutes per account (counted:false past that)
+//   {t:"vwar", q} -> {t:"vwar", q, wk, rows, pw, prev}  this week's and last week's Village War: [{v, w, g}] per village;
+//                                                     wk and pw are the ISO weeks of rows and prev (also GET /vwar)
 //   With no database every reply is {t, q, off:true}, and the game keeps everything on the player's computer.
 //
 // Security and privacy (server 2.0):
@@ -32,7 +37,7 @@
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
-const VERSION = '2.3.0';
+const VERSION = '2.4.0';
 const Store = require('./store');
 const MAX_PRESENCE = 4096, MAX_ROOMS_PER_CLIENT = 4, MAX_MSGS_PER_SEC = 120, MAX_BYTES_PER_SEC = 96 * 1024, ROOM_RE = /^[a-z0-9-]{1,32}$/;
 const MAX_ROOM_MEMBERS = 30, MAX_JOINS_PER_MIN = 20, LOBBY = 'lobby';
@@ -51,6 +56,10 @@ function start(o = {}) {
   const kageC = new Map();
   const kageList = mode => { const c = kageC.get(mode); if (c && Date.now() - c.at < 30000) return c.p;
     const p = store.kage(mode, Store.KAGE_TOP).then(k => ({ rows: k.rows.map(pubRow), total: k.total })); p.catch(() => kageC.delete(mode)); kageC.set(mode, { at: Date.now(), p }); return p; };
+  // Village War: this week's and last week's totals, kept for 30 s
+  let vwC = null;
+  const vwarList = () => { if (vwC && Date.now() - vwC.at < 30000) return vwC.p; const now = Date.now(), wk = Store.weekOf(now), pw = Store.weekOf(now - 7 * 864e5);
+    const p = Promise.all([store.getVW(wk), store.getVW(pw)]).then(([rows, prev]) => ({ wk, rows, pw, prev })); p.catch(() => { vwC = null; }); vwC = { at: Date.now(), p }; return p; };
   const acctTries = new Map();   // address -> Map(account hash -> last sign-in time), the last hour
   const maxConns = +o.maxConnections || 300, maxPerIp = +o.maxPerAddress || 16, trustProxy = !!o.trustProxy;
   // the key that turns private tokens into public ids; new on every start unless KK_SECRET is set
@@ -77,6 +86,11 @@ function start(o = {}) {
       if (!store) return J(200, { off: true });
       if (!Store.MODES.includes(mode)) return J(400, { err: 'Unknown mode.' });
       kageList(mode).then(k => J(200, { mode, ...k }), e => { log('Accounts: ' + (e && e.message)); J(500, { err: 'The account service had a problem.' }); }); return;
+    }
+    if (rel === 'vwar') {   // Village War, read-only and public (village totals only)
+      const J = (code, o) => { res.writeHead(code, { ...hdr, 'content-type': 'application/json', 'access-control-allow-origin': '*', 'cache-control': 'max-age=30' }); res.end(JSON.stringify(o)); };
+      if (!store) return J(200, { off: true });
+      vwarList().then(k => J(200, k), e => { log('Accounts: ' + (e && e.message)); J(500, { err: 'The account service had a problem.' }); }); return;
     }
     if (!game) { res.writeHead(200, { ...hdr, 'content-type': 'text/plain' }); res.end('Kage Kami multiplayer server is running.\n'); return; }
     if (!rel) rel = 'index.html';
@@ -167,7 +181,7 @@ function start(o = {}) {
         send(ws, { t: 'welcome', peer: c.peer, by: c.by, v: VERSION }); return;
       }
       if (!c.ok) return;
-      if (m.t === 'acct' || m.t === 'save' || m.t === 'rank' || m.t === 'top' || m.t === 'kage') { account(c, m, now); return; }
+      if (m.t === 'acct' || m.t === 'save' || m.t === 'rank' || m.t === 'top' || m.t === 'kage' || m.t === 'vw' || m.t === 'vwar') { account(c, m, now); return; }
       const r = typeof m.r === 'string' && ROOM_RE.test(m.r) ? m.r : null; if (!r) return;
       if (m.t === 'join') {
         if (c.rooms.has(r)) return; if (c.rooms.size >= MAX_ROOMS_PER_CLIENT) { send(ws, { t: 'err', r, m: 'Too many rooms.' }); return; }
@@ -207,6 +221,10 @@ function start(o = {}) {
         tries.set(h, now); acctTries.set(addr, tries);
         store.touch(h).then(fresh => { c.acct = h; reply({ ok: true, me: Store.pubOf(h), fresh }); }, fail); return;
       }
+      if (m.t === 'vwar') {
+        c.tops = (c.tops || []).filter(t => now - t < 10000); if (c.tops.length >= 6) { reply({ err: 'busy' }); return; } c.tops.push(now);
+        vwarList().then(k => reply(k), fail); return;
+      }
       if (m.t === 'top' || m.t === 'kage') {
         c.tops = (c.tops || []).filter(t => now - t < 10000); if (c.tops.length >= 6) { reply({ err: 'busy' }); return; } c.tops.push(now);
         if (!Store.MODES.includes(m.mode)) { reply({ err: 'Unknown mode.' }); return; }
@@ -219,6 +237,10 @@ function start(o = {}) {
         if (now - (c.saveT || 0) < 1500) { reply({ err: 'busy' }); return; } c.saveT = now;
         if (!m.d || typeof m.d !== 'object' || Array.isArray(m.d) || Buffer.byteLength(JSON.stringify(m.d)) > Store.MAX_SAVE) { reply({ err: 'That save is too big.' }); return; }
         store.setSave(c.acct, m.d).then(() => reply({ ok: true }), fail); return;
+      }
+      if (m.t === 'vw') {
+        if (!Store.VILLAGES.includes(m.v) || typeof m.win !== 'boolean') { reply({ err: 'Bad Village War result.' }); return; }
+        store.addVW(c.acct, Store.weekOf(now), m.v, m.win, now).then(counted => { if (counted) vwC = null; reply({ ok: true, counted }); }, fail); return;
       }
       if (m.t === 'rank') {
         const row = Store.cleanRank(m.row); if (!row) { reply({ err: 'Bad ranked standing.' }); return; }

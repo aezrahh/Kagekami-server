@@ -38,13 +38,14 @@ that waits up to a minute while it wakes (the game keeps retrying by itself).
 
 Optional, and on only when the server has a database. Players get an **anonymous account**: the launcher makes a random
 account code (like `KK-7F3Q-92XM-AB4C-DE5F`) and keeps it; there is no email and no password. The server stores only a
-SHA-256 of the code, plus the account's cloud save (64 KiB at most) and its ranked standing per mode. Writing the code
+SHA-256 of the code, plus the account's cloud save (64 KiB at most), its ranked standing per mode and, for Village War, how many results it
+added this week and when the last one came (one row per account, replaced each week; no older weeks are kept). Writing the code
 down lets a player sign in on another computer. The leaderboard shows nicknames and short public ids, never the code.
 
 1. Make a Postgres database. Neon's free plan (neon.tech) doesn't expire; Render's own free Postgres is deleted after
    30 days, its paid plan doesn't.
 2. Copy its connection address (`postgresql://…`) into the Render service's Environment as `DATABASE_URL` and save.
-   The server creates its tables (`kk_acct`, `kk_save`, `kk_rank`) by itself; `/status` then shows `"accounts":"postgres"`.
+   The server creates its tables (`kk_acct`, `kk_save`, `kk_rank`, and `kk_vw`, `kk_vwa` for Village War) by itself; `/status` then shows `"accounts":"postgres"`.
 
 Without `DATABASE_URL` everything works as before and each game keeps its saves and ranks on the player's computer.
 Ranked results are reported by the players' games, so a modified game could post a fake rank.
@@ -55,6 +56,14 @@ The players at the top rank, Kage, get their own list: the 500 best of each rank
 Villages), ordered by Mission Seals and then rating, with the same names and short public ids as the leaderboard. Games
 ask for it with `{t:"kage", mode}`; web pages can read `GET /kage?mode=duel` (read-only, kept for 30 seconds). Ranks
 above Kage can't be posted any more: a row is held to Kage at most.
+
+## Village War (server 2.4)
+
+A weekly server-wide score: every signed-in player's online match adds a game, and a win when they won, to their
+village (`leaf`, `sand`, `mist`, `cloud`, `stone`). Games send `{t:"vw", v, win}` when an online match ends and read
+`{t:"vwar"}` for this week's and last week's totals (`GET /vwar` for web pages, kept for 30 seconds). Weeks are ISO weeks
+in UTC, starting on Monday. To keep one player from swinging it, an account adds at most 40 results a week and at most one
+every 10 minutes. Only village totals are public; nothing ties a result to a player.
 
 Settings (environment variables): `DATABASE_URL` (accounts, above), `KK_PASSWORD`, `PORT`, `KK_HOST` (address to listen on, for example `127.0.0.1` behind
 Caddy), `KK_TRUST_PROXY=1` (on by itself on Render; set it behind another proxy that sets `X-Forwarded-For`), `KK_SECRET` (keeps player IDs
