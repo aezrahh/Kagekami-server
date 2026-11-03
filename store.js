@@ -9,6 +9,9 @@ const KAGE = 5, KAGE_TOP = 500;
 // Village War (server 2.4): a weekly server-wide score of online matches by village; each account adds at most VW_MAX
 // results a week, and at most one every VW_GAP ms (an online match lasts longer than that)
 const VILLAGES = ['leaf', 'sand', 'mist', 'cloud', 'stone'], VW_MAX = 40, VW_GAP = 10 * 60 * 1000;
+// online match modes the server knows (2.5). Ranked is ffa and duel only (MODES); the Chūnin Exam Arena ("arena", 8 players
+// in 4 cells of two) is played online but never counts for ranked or Village War.
+const MATCH_MODES = ['ffa', 'duel', 'aram', 'kura', 'arena'], VW_SKIP = ['arena'];
 // ISO week of a time, as "2026-W44" (weeks start on Monday, UTC)
 function weekOf(t = Date.now()) {
   const d = new Date(t), day = (d.getUTCDay() + 6) % 7, th = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - day + 3));
@@ -101,4 +104,4 @@ function open(o = {}) {
   if (o.memory) return memory();
   return null;
 }
-module.exports = { open, CODE_RE, hashCode, pubOf, cleanRank, cleanName, MODES, MAX_SAVE, KAGE, KAGE_TOP, VILLAGES, VW_MAX, VW_GAP, weekOf };
+module.exports = { open, CODE_RE, hashCode, pubOf, cleanRank, cleanName, MODES, MAX_SAVE, KAGE, KAGE_TOP, VILLAGES, VW_MAX, VW_GAP, MATCH_MODES, VW_SKIP, weekOf };

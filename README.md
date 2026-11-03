@@ -65,6 +65,15 @@ village (`leaf`, `sand`, `mist`, `cloud`, `stone`). Games send `{t:"vw", v, win}
 in UTC, starting on Monday. To keep one player from swinging it, an account adds at most 40 results a week and at most one
 every 10 minutes. Only village totals are public; nothing ties a result to a player.
 
+## Chūnin Exam Arena online (server 2.5)
+
+The arena (`arena`, 2v2v2v2: 8 players in 4 cells of two) runs in an ordinary match room: the host publishes `set` with
+`mode:"arena"` and 8 seats `[[pid, slot, by]]` (slot 0..7, cell = slot >> 1), and the match lock, reconnects and host
+hand-over work as in the other modes. It never counts for ranked (`{t:"rank"}` with mode `arena` is refused, and there is no
+arena leaderboard) or for Village War (`{t:"vw", v, win, mode:"arena"}` answers `counted:false, skip:"mode"`; games should
+send `mode` with every result). `welcome` and `/status` carry `feat` (`["acct","kage","vwar","arena"]`), so a game offers
+the arena online only on a server that lists `arena`.
+
 Settings (environment variables): `DATABASE_URL` (accounts, above), `KK_PASSWORD`, `PORT`, `KK_HOST` (address to listen on, for example `127.0.0.1` behind
 Caddy), `KK_TRUST_PROXY=1` (on by itself on Render; set it behind another proxy that sets `X-Forwarded-For`), `KK_SECRET` (keeps player IDs
 the same across restarts, so matches survive them), `KK_MAX_CONNECTIONS`, `KK_MAX_PER_ADDRESS`.
