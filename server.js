@@ -16,12 +16,16 @@
 //   {t:"top", q, mode} -> {t:"top", q, mode, rows}      the leaderboard: the top 100 of a mode, with short public ids
 //   {t:"kage", q, mode} -> {t:"kage", q, mode, rows, total}   the Top 500 Kage: Kage-rank players of a mode by seals,
 //                                                     then rating (also GET /kage?mode=duel, for web pages)
-//   {t:"vw", q, v, win} -> {t:"vw", q, ok, counted}     Village War (2.4): this account's village (leaf, sand, mist, cloud,
-//                                                     stone) and whether it won an online match; at most 40 a week, one
-//                                                     every 10 minutes per account (counted:false past that)
+//   {t:"vw", q, v, win, mode?} -> {t:"vw", q, ok, counted}   Village War (2.4): this account's village (leaf, sand, mist,
+//                                                     cloud, stone) and whether it won an online match; at most 40 a week, one
+//                                                     every 10 minutes per account (counted:false past that). 2.5: with
+//                                                     mode "arena" it is never counted (counted:false, skip:"mode")
 //   {t:"vwar", q} -> {t:"vwar", q, wk, rows, pw, prev}  this week's and last week's Village War: [{v, w, g}] per village;
 //                                                     wk and pw are the ISO weeks of rows and prev (also GET /vwar)
 //   With no database every reply is {t, q, off:true}, and the game keeps everything on the player's computer.
+// Chūnin Exam Arena (2.5): an ordinary match room (8 players, seats [[pid, slot, by]] with slot 0..7, cell = slot >> 1); the
+// relay needs nothing mode-specific. Ranked refuses mode "arena" ({t:"rank"} -> err) and Village War skips it.
+// welcome carries feat (FEATURES), and /status lists it too, so a game offers the arena online only on a 2.5+ server.
 //
 // Security and privacy (server 2.0):
 // - Player IDs are issued by the server. A client sends a private token; everyone else only ever sees `by`, a keyed hash
@@ -37,7 +41,9 @@
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
-const VERSION = '2.4.0';
+const VERSION = '2.5.0';
+// what this server supports, so a game can check before offering a mode online (welcome.feat and /status)
+const FEATURES = ['acct', 'kage', 'vwar', 'arena'];
 const Store = require('./store');
 const MAX_PRESENCE = 4096, MAX_ROOMS_PER_CLIENT = 4, MAX_MSGS_PER_SEC = 120, MAX_BYTES_PER_SEC = 96 * 1024, ROOM_RE = /^[a-z0-9-]{1,32}$/;
 const MAX_ROOM_MEMBERS = 30, MAX_JOINS_PER_MIN = 20, LOBBY = 'lobby';
@@ -80,7 +86,7 @@ function start(o = {}) {
   function serveHttp(req, res) {
     const hdr = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' };
     let u, rel; try { u = new URL(req.url, 'http://x'); rel = decodeURIComponent(u.pathname).replace(/^\/+/, ''); } catch (e) { res.writeHead(400, hdr); res.end(); return; }
-    if (rel === 'status') { res.writeHead(200, { ...hdr, 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify({ kageKami: true, version: VERSION, rooms: rooms.size, players: count(), game: !!game, accounts: store ? store.kind : 'off' })); return; }
+    if (rel === 'status') { res.writeHead(200, { ...hdr, 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify({ kageKami: true, version: VERSION, feat: FEATURES, rooms: rooms.size, players: count(), game: !!game, accounts: store ? store.kind : 'off' })); return; }
     if (rel === 'kage') {   // the Top 500 Kage, read-only and public (names and short public ids only)
       const mode = u.searchParams.get('mode') || 'duel', J = (code, o) => { res.writeHead(code, { ...hdr, 'content-type': 'application/json', 'access-control-allow-origin': '*', 'cache-control': 'max-age=30' }); res.end(JSON.stringify(o)); };
       if (!store) return J(200, { off: true });
@@ -178,7 +184,7 @@ function start(o = {}) {
         const okTok = t => typeof t === 'string' && TOK_RE.test(t) && !PUB_RE.test(t);
         const tok = okTok(m.tok) ? m.tok : okTok(m.by) ? m.by : crypto.randomBytes(16).toString('hex');
         c.ok = true; c.by = pubId(tok); c.name = String(m.name || '').replace(/[\u0000-\u001f\u007f<>]/g, '').trim().slice(0, 24);
-        send(ws, { t: 'welcome', peer: c.peer, by: c.by, v: VERSION }); return;
+        send(ws, { t: 'welcome', peer: c.peer, by: c.by, v: VERSION, feat: FEATURES }); return;
       }
       if (!c.ok) return;
       if (m.t === 'acct' || m.t === 'save' || m.t === 'rank' || m.t === 'top' || m.t === 'kage' || m.t === 'vw' || m.t === 'vwar') { account(c, m, now); return; }
@@ -239,7 +245,8 @@ function start(o = {}) {
         store.setSave(c.acct, m.d).then(() => reply({ ok: true }), fail); return;
       }
       if (m.t === 'vw') {
-        if (!Store.VILLAGES.includes(m.v) || typeof m.win !== 'boolean') { reply({ err: 'Bad Village War result.' }); return; }
+        if (!Store.VILLAGES.includes(m.v) || typeof m.win !== 'boolean' || (m.mode !== undefined && !Store.MATCH_MODES.includes(m.mode))) { reply({ err: 'Bad Village War result.' }); return; }
+        if (Store.VW_SKIP.includes(m.mode)) { reply({ ok: true, counted: false, skip: 'mode' }); return; }   // 2.5: the arena never counts
         store.addVW(c.acct, Store.weekOf(now), m.v, m.win, now).then(counted => { if (counted) vwC = null; reply({ ok: true, counted }); }, fail); return;
       }
       if (m.t === 'rank') {
