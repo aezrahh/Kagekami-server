@@ -18,11 +18,11 @@ function client(url, tok) {
 const tok = i => ('arenaTok' + i).padEnd(24, 'x'), code = i => 'KK-ARN' + 'ABCDEFGH'[i] + '-AAAA-BBBB-CCCC', R = 'kr-arena-test';
 
 (async () => {
-  const srv = await start({ port: 7561, store: Store.open({ memory: true }), log: () => {} }); const U = 'ws://127.0.0.1:7561';
+  const srv = await start({ port: 7561, store: Store.open({ memory: true }), log: () => {}, vwMinAge: 0 }); const U = 'ws://127.0.0.1:7561';
   const P = []; for (let i = 0; i < 8; i++) { P.push(client(U, tok(i))); await P[i].ready; }
   ok(P[0].feat && P[0].feat.includes('arena'), 'welcome lists the arena feature');
   const st = await fetch('http://127.0.0.1:7561/status').then(x => x.json()).catch(() => null);
-  ok(st && st.version === '2.5.0' && st.feat.includes('arena'), '/status shows 2.5.0 and the arena feature');
+  ok(st && st.version === require('../server.js').VERSION && st.feat.includes('arena'), '/status shows the version and the arena feature');
   for (let i = 0; i < 8; i++) { const r = await P[i].ask({ t: 'acct', code: code(i) }); if (!r || !r.ok) ok(false, 'sign-in ' + i); }
 
   // the host opens the room, everyone joins, the host seats 8 players in 4 cells (slot >> 1)

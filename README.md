@@ -74,6 +74,20 @@ arena leaderboard) or for Village War (`{t:"vw", v, win, mode:"arena"}` answers 
 send `mode` with every result). `welcome` and `/status` carry `feat` (`["acct","kage","vwar","arena"]`), so a game offers
 the arena online only on a server that lists `arena`.
 
+## Security pass (server 2.6)
+
+- Addresses: behind Render the per-address limits use `True-Client-IP` / `CF-Connecting-IP` (set by Cloudflare in front of
+  Render, which players can't change). Before, the first `X-Forwarded-For` entry was used, and a player could make it up.
+- Every message has its `"__proto__"` keys dropped, so a presence can't hide fields (a host claim, a cid, a match lock)
+  from the checks, and games never receive one.
+- Per address: at most 30 new connections a minute and 20 new accounts a day (signing in to a known account always works).
+- Ranked rows are held to the game's own rules: games go up by at most one per 2 minutes since the account's last row, and
+  rank and seals can't exceed what that many games can earn (placement at Chūnin with 80 seals at most, then 30 seals a
+  win at most). Anything beyond is cut back, never refused; the reply says `held:true`. Ranked results are still reported
+  by the games, so this makes a forged Kage cost real time per account rather than making it impossible.
+- Village War: results from accounts made in the last 10 minutes answer `counted:false, skip:"new"`, and one address adds
+  at most 12 counted results an hour (`skip:"address"`).
+
 Settings (environment variables): `DATABASE_URL` (accounts, above), `KK_PASSWORD`, `PORT`, `KK_HOST` (address to listen on, for example `127.0.0.1` behind
 Caddy), `KK_TRUST_PROXY=1` (on by itself on Render; set it behind another proxy that sets `X-Forwarded-For`), `KK_SECRET` (keeps player IDs
 the same across restarts, so matches survive them), `KK_MAX_CONNECTIONS`, `KK_MAX_PER_ADDRESS`.
