@@ -37,16 +37,28 @@
 // - While a match is being set up or running, only players who hold a seat in it can join the room.
 // - Limits: connections per address and in total, wrong passwords per address, joins per minute, members per room,
 //   messages and bytes per second.
+// Server 2.6 (security pass):
+// - Behind Render's proxy the address comes from True-Client-IP / CF-Connecting-IP (set by Cloudflare, which the
+//   player can't change), not from the first X-Forwarded-For entry, which a player could make up to dodge the limits.
+// - "__proto__" keys are dropped from every message, so no presence can change how objects behave here or in games.
+// - New connections per address per minute and new accounts per address per day are capped.
+// - Ranked rows are held to what the game's own rules allow: at most one game per RANK_GAME_MS since the account's last
+//   row, and no more rank and seals than that many games can earn. Village War skips accounts made in the last
+//   10 minutes and caps results per address per hour.
 // - Nothing about players is logged or written to disk. Addresses are kept in memory only, for the limits above.
-const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
+const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto'), net = require('net');
 const { WebSocketServer } = require('ws');
 
-const VERSION = '2.5.0';
+const VERSION = '2.6.0';
 // what this server supports, so a game can check before offering a mode online (welcome.feat and /status)
 const FEATURES = ['acct', 'kage', 'vwar', 'arena'];
 const Store = require('./store');
 const MAX_PRESENCE = 4096, MAX_ROOMS_PER_CLIENT = 4, MAX_MSGS_PER_SEC = 120, MAX_BYTES_PER_SEC = 96 * 1024, ROOM_RE = /^[a-z0-9-]{1,32}$/;
 const MAX_ROOM_MEMBERS = 30, MAX_JOINS_PER_MIN = 20, LOBBY = 'lobby';
+// per address: new connections a minute, new accounts a day, counted Village War results an hour
+const MAX_CONNS_PER_MIN = 30, MAX_FRESH_PER_DAY = 20, MAX_VW_PER_HOUR = 12, VW_MIN_AGE = 10 * 60 * 1000;
+// JSON.parse that drops "__proto__" keys at any depth
+const parseSafe = s => JSON.parse(s, (k, v) => k === '__proto__' ? undefined : v);
 const TOK_RE = /^[A-Za-z0-9_-]{16,128}$/, CID_RE = /^[A-Za-z0-9_-]{1,40}$/, PUB_RE = /^p[0-9a-f]{20}$/;
 // fields only the room's host may publish (the game's lockstep host state)
 const HOST_KEYS = ['host', 'he', 'set', 'seats', 'mt', 'st', 'T', 'K', 'po', 'drop', 'ds', 'props'];
@@ -67,6 +79,10 @@ function start(o = {}) {
   const vwarList = () => { if (vwC && Date.now() - vwC.at < 30000) return vwC.p; const now = Date.now(), wk = Store.weekOf(now), pw = Store.weekOf(now - 7 * 864e5);
     const p = Promise.all([store.getVW(wk), store.getVW(pw)]).then(([rows, prev]) => ({ wk, rows, pw, prev })); p.catch(() => { vwC = null; }); vwC = { at: Date.now(), p }; return p; };
   const acctTries = new Map();   // address -> Map(account hash -> last sign-in time), the last hour
+  const freshBy = new Map(), vwBy = new Map(), connBy = new Map();   // address -> times of new accounts (a day), counted Village War results (an hour), connections (a minute)
+  const recent = (m, a, now, win) => { const l = (m.get(a) || []).filter(t => now - t < win); m.set(a, l); return l; };
+  const rankGameMs = o.rankGameMs !== undefined ? +o.rankGameMs : Store.RANK_GAME_MS, vwMinAge = o.vwMinAge !== undefined ? +o.vwMinAge : VW_MIN_AGE;
+  const freshPerDay = +o.freshPerDay || MAX_FRESH_PER_DAY, vwPerHour = +o.vwPerHour || MAX_VW_PER_HOUR, connsPerMin = +o.connsPerMinute || MAX_CONNS_PER_MIN;
   const maxConns = +o.maxConnections || 300, maxPerIp = +o.maxPerAddress || 16, trustProxy = !!o.trustProxy;
   // the key that turns private tokens into public ids; new on every start unless KK_SECRET is set
   // Set it (KK_SECRET; on Render it is derived from the service) so players keep their IDs, and with them their seats,
@@ -80,7 +96,8 @@ function start(o = {}) {
   const perIp = new Map();   // address -> open connections
   const fails = new Map();   // address -> { n, until }: wrong passwords
   const sweep = setInterval(() => { const now = Date.now(); for (const [k, f] of fails) if (f.until < now && now - f.at > 600000) fails.delete(k);
-    for (const [a, m] of acctTries) { for (const [h, t] of m) if (now - t >= 3600000) m.delete(h); if (!m.size) acctTries.delete(a); } }, 60000);
+    for (const [a, m] of acctTries) { for (const [h, t] of m) if (now - t >= 3600000) m.delete(h); if (!m.size) acctTries.delete(a); }
+    for (const [m, win] of [[freshBy, 864e5], [vwBy, 3600000], [connBy, 60000]]) for (const a of [...m.keys()]) if (!recent(m, a, now, win).length) m.delete(a); }, 60000);
 
   const server = http.createServer((req, res) => { try { serveHttp(req, res); } catch (e) { log('HTTP error: ' + (e && e.message)); try { res.writeHead(500); res.end(); } catch (x) {} } });
   function serveHttp(req, res) {
@@ -110,7 +127,9 @@ function start(o = {}) {
   const info = c => ({ peer: c.peer, by: c.by, name: c.name });
   // a client that stops reading (over 1 MiB waiting) is dropped instead of filling the server's memory
   const send = (ws, m) => { if (ws.readyState !== 1) return; if (ws.bufferedAmount > 1 << 20) { ws.terminate(); return; } ws.send(JSON.stringify(m)); };
+  // behind Render (Cloudflare in front): Cloudflare's own client headers first, since a player can send any X-Forwarded-For
   const addrOf = req => {
+    if (trustProxy) for (const k of ['true-client-ip', 'cf-connecting-ip']) { const v = String(req.headers[k] || '').trim(); if (net.isIP(v)) return v; }
     const fwd = trustProxy && String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
     return fwd || req.socket.remoteAddress || '?';
   };
@@ -164,6 +183,7 @@ function start(o = {}) {
     if (f && f.until > Date.now()) { send(ws, { t: 'err', m: 'Too many wrong passwords. Try again in a few minutes.' }); ws.close(); return; }
     if (count() > maxConns) { send(ws, { t: 'err', m: 'The server is full.' }); ws.close(); return; }
     if ((perIp.get(addr) || 0) >= maxPerIp) { send(ws, { t: 'err', m: 'Too many connections from your address.' }); ws.close(); return; }
+    { const l = recent(connBy, addr, Date.now(), 60000); if (l.length >= connsPerMin) { send(ws, { t: 'err', m: 'Too many connections from your address. Wait a minute.' }); ws.close(); return; } l.push(Date.now()); }
     perIp.set(addr, (perIp.get(addr) || 0) + 1);
     const c = { ws, peer: crypto.randomBytes(8).toString('hex'), by: null, name: '', ok: false, rooms: new Map(), n: 0, bytes: 0, t0: Date.now(), joins: [] };
     ws._kkAlive = true; ws.on('pong', () => { ws._kkAlive = true; });
@@ -172,7 +192,7 @@ function start(o = {}) {
     const handle = buf => {
       const now = Date.now(); if (now - c.t0 > 1000) { c.t0 = now; c.n = 0; c.bytes = 0; }
       c.bytes += buf.length; if (++c.n > MAX_MSGS_PER_SEC || c.bytes > MAX_BYTES_PER_SEC) return;   // flood guard
-      let m; try { m = JSON.parse(buf.toString('utf8')); } catch (e) { return; } if (!m || typeof m !== 'object' || Array.isArray(m)) return;
+      let m; try { m = parseSafe(buf.toString('utf8')); } catch (e) { return; } if (!m || typeof m !== 'object' || Array.isArray(m)) return;
       if (m.t === 'hello') {
         if (c.ok) return;
         if (password && !pwOk(m.pw)) {
@@ -225,7 +245,11 @@ function start(o = {}) {
         const tries = acctTries.get(addr) || new Map(); for (const [k, t] of tries) if (now - t >= 3600000) tries.delete(k);
         if (!tries.has(h) && tries.size >= 30) { reply({ err: 'Too many sign-ins from your address. Try later.' }); return; }
         tries.set(h, now); acctTries.set(addr, tries);
-        store.touch(h).then(fresh => { c.acct = h; reply({ ok: true, me: Store.pubOf(h), fresh }); }, fail); return;
+        // new accounts: at most freshPerDay a day from one address (signing in to one you already have always works)
+        store.getAcct(h).then(a => {
+          if (!a) { const l = recent(freshBy, addr, Date.now(), 864e5); if (l.length >= freshPerDay) { reply({ err: 'Too many new accounts from your address today. Try tomorrow.' }); return; } l.push(Date.now()); }
+          return store.touch(h).then(fresh => { c.acct = h; c.acctAt = a ? a.at : Date.now(); reply({ ok: true, me: Store.pubOf(h), fresh }); });
+        }).catch(fail); return;
       }
       if (m.t === 'vwar') {
         c.tops = (c.tops || []).filter(t => now - t < 10000); if (c.tops.length >= 6) { reply({ err: 'busy' }); return; } c.tops.push(now);
@@ -247,12 +271,18 @@ function start(o = {}) {
       if (m.t === 'vw') {
         if (!Store.VILLAGES.includes(m.v) || typeof m.win !== 'boolean' || (m.mode !== undefined && !Store.MATCH_MODES.includes(m.mode))) { reply({ err: 'Bad Village War result.' }); return; }
         if (Store.VW_SKIP.includes(m.mode)) { reply({ ok: true, counted: false, skip: 'mode' }); return; }   // 2.5: the arena never counts
-        store.addVW(c.acct, Store.weekOf(now), m.v, m.win, now).then(counted => { if (counted) vwC = null; reply({ ok: true, counted }); }, fail); return;
+        // 2.6: brand-new accounts don't count yet, and one address adds at most vwPerHour results an hour
+        if (now - (c.acctAt || 0) < vwMinAge) { reply({ ok: true, counted: false, skip: 'new' }); return; }
+        const l = recent(vwBy, addr, now, 3600000); if (l.length >= vwPerHour) { reply({ ok: true, counted: false, skip: 'address' }); return; }
+        store.addVW(c.acct, Store.weekOf(now), m.v, m.win, now).then(counted => { if (counted) { vwC = null; l.push(now); } reply({ ok: true, counted }); }, fail); return;
       }
       if (m.t === 'rank') {
         const row = Store.cleanRank(m.row); if (!row) { reply({ err: 'Bad ranked standing.' }); return; }
         c.rankT = c.rankT || {}; if (now - (c.rankT[row.mode] || 0) < 1500) { reply({ err: 'busy' }); return; } c.rankT[row.mode] = now;
-        store.setRank(c.acct, row).then(() => reply({ ok: true }), fail); return;
+        // 2.6: held to what the game's rules allow since this account's last row (held: true tells the game it was cut)
+        const h = c.acct, since = c.acctAt || now;
+        store.getRank(h, row.mode).then(prev => { const ok = Store.checkRank(row, prev, since, now, rankGameMs);
+          return store.setRank(h, ok).then(() => reply({ ok: true, ...(ok.tier !== row.tier || ok.seals !== row.seals || ok.g !== row.g ? { held: true } : {}) })); }).catch(fail); return;
       }
     }
     ws.on('close', () => { for (const r of [...c.rooms.keys()]) leave(c, r); const n = (perIp.get(addr) || 1) - 1; if (n > 0) perIp.set(addr, n); else perIp.delete(addr); });

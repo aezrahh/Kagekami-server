@@ -13,7 +13,7 @@ function client(url) {
   return c;
 }
 async function run(label, store, port) {
-  const srv = await start({ port, store, log: () => {} }); const U = 'ws://127.0.0.1:' + port;
+  const srv = await start({ port, store, log: () => {}, rankGameMs: 0, freshPerDay: 100 }); const U = 'ws://127.0.0.1:' + port;
   const A = client(U), B = client(U); await A.ready; await B.ready; await sleep(80);
   const codeA = 'KK-AB2C-DE3F-GH4J-KM5N', codeB = 'KK-PQ6R-ST7U-VW8X-YZ9A';
   let r = await A.ask({ t: 'save' }); ok(r && /Not signed in/.test(r.err), label + ': save needs sign-in');
@@ -45,7 +45,7 @@ async function run(label, store, port) {
 }
 // the Top 500 Kage: only Kage-rank rows, by seals then rating, capped at 500, over WebSocket and HTTP
 async function kage(label, store, port, many) {
-  const srv = await start({ port, store, log: () => {} }); const U = 'ws://127.0.0.1:' + port;
+  const srv = await start({ port, store, log: () => {}, rankGameMs: 0, freshPerDay: 100 }); const U = 'ws://127.0.0.1:' + port;
   const rows = [['KK-KAGA-AAAA-BBBB-CCCC', 5, 50, 1600], ['KK-KAGB-AAAA-BBBB-CCCC', 5, 50, 1700], ['KK-KAGC-AAAA-BBBB-CCCC', 5, 120, 1550], ['KK-KAGD-AAAA-BBBB-CCCC', 4, 99, 1500], ['KK-KAGE-AAAA-BBBB-CCCC', 30, 200, 1400]];
   const me = [];
   for (const [code, tier, seals, mmr] of rows) { const c = client(U); await c.ready; await sleep(30); const a = await c.ask({ t: 'acct', code }); me.push(a && a.me);
@@ -66,7 +66,7 @@ async function kage(label, store, port, many) {
 }
 // Village War: signed-in accounts add online results by village; capped per account; public totals over WS and HTTP
 async function vwar(label, store, port) {
-  const srv = await start({ port, store, log: () => {} }); const U = 'ws://127.0.0.1:' + port;
+  const srv = await start({ port, store, log: () => {}, vwMinAge: 0 }); const U = 'ws://127.0.0.1:' + port;
   const A = client(U), B = client(U); await A.ready; await B.ready; await sleep(60);
   let r = await A.ask({ t: 'vw', v: 'leaf', win: true }); ok(r && /Not signed in/.test(r.err), label + ': Village War needs sign-in');
   await A.ask({ t: 'acct', code: 'KK-VWAA-AAAA-BBBB-CCCC' }); await B.ask({ t: 'acct', code: 'KK-VWBB-AAAA-BBBB-CCCC' });

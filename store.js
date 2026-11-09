@@ -25,6 +25,8 @@ function memory() {
     kind: 'memory',
     async ready() {},
     async touch(h) { const now = Date.now(); const a = acct.get(h); if (a) { a.seen = now; return false; } acct.set(h, { at: now, seen: now }); return true; },
+    async getAcct(h) { const a = acct.get(h); return a ? { at: a.at } : null; },
+    async getRank(h, mode) { const r = rank.get(h + ':' + mode); return r ? { ...r } : null; },
     async getSave(h) { const s = save.get(h); return s ? JSON.parse(s) : null; },
     async setSave(h, d) { save.set(h, JSON.stringify(d)); },
     async setRank(h, row) { rank.set(h + ':' + row.mode, { h, ...row }); },
@@ -59,6 +61,9 @@ function postgres(url, log) {
       await q(`CREATE TABLE IF NOT EXISTS kk_vwa (h text PRIMARY KEY REFERENCES kk_acct(h) ON DELETE CASCADE, wk text NOT NULL, n int NOT NULL, at bigint NOT NULL)`);
     },
     async touch(h) { const now = Date.now(); const r = await q(`INSERT INTO kk_acct (h, at, seen) VALUES ($1, $2, $2) ON CONFLICT (h) DO UPDATE SET seen = $2 RETURNING (xmax = 0) AS fresh`, [h, now]); return !!r.rows[0].fresh; },
+    async getAcct(h) { const r = await q(`SELECT at FROM kk_acct WHERE h = $1`, [h]); return r.rows[0] ? { at: +r.rows[0].at } : null; },
+    async getRank(h, mode) { const r = await q(`SELECT tier, seals, mmr, g, w, at FROM kk_rank WHERE h = $1 AND mode = $2`, [h, mode]); const x = r.rows[0];
+      return x ? { tier: x.tier, seals: x.seals, mmr: x.mmr, g: x.g, w: x.w, at: +x.at } : null; },
     async getSave(h) { const r = await q(`SELECT d FROM kk_save WHERE h = $1`, [h]); return r.rows[0] ? r.rows[0].d : null; },
     async setSave(h, d) { await q(`INSERT INTO kk_save (h, d, at) VALUES ($1, $2, $3) ON CONFLICT (h) DO UPDATE SET d = $2, at = $3`, [h, JSON.stringify(d), Date.now()]); },
     async setRank(h, r) { await q(`INSERT INTO kk_rank (h, mode, nm, tier, seals, mmr, g, w, at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
@@ -98,10 +103,29 @@ function cleanRank(m) {
   return { mode: m.mode, nm: cleanName(m.nm), tier: clampInt(m.tier, -1, KAGE), seals: clampInt(m.seals, 0, 100000), mmr: clampInt(m.mmr, 0, 10000), g, w, at: Date.now() };
 }
 
+// Server 2.6: a ranked row is held to what the game's own rules (Rank in the game, 13.44+) allow. The game places a player
+// after RK_PLACE (5) games at Chūnin at most with up to 80 seals, a win then gives at most 30 seals, and 100 seals promote;
+// so after g games rank * 100 + seals is at most 280 + 30 * (g - 5). On top of that, games played go up by at most one per
+// RANK_GAME_MS since the account's last row (or since the account was made). A row with fewer games than the last one is a
+// new season and starts again from the account's age. Anything beyond is cut back, never refused, so a real player's
+// board keeps updating.
+const RK_PLACE = 5, RANK_GAME_MS = 2 * 60 * 1000;
+function checkRank(row, prev, since, now, gameMs = RANK_GAME_MS) {
+  const r = { ...row }, base = prev && r.g >= prev.g ? prev : null, g0 = base ? base.g : 0;
+  if (gameMs > 0) { const room = 1 + Math.floor(Math.max(0, now - (base ? base.at : since)) / gameMs); if (r.g > g0 + room) r.g = g0 + room; }
+  r.w = Math.min(r.w, r.g); if (base) r.w = Math.min(r.w, base.w + (r.g - base.g));
+  if (base && r.g === base.g) { r.tier = base.tier; r.seals = base.seals; r.mmr = base.mmr; r.w = base.w; return r; }   // no new game, no new rank
+  if (r.g < RK_PLACE || r.tier < 0) { r.tier = -1; r.seals = 0; }
+  else { const cap = 280 + 30 * (r.g - RK_PLACE); let pts = r.tier * 100 + r.seals; if (pts > cap) { pts = cap; r.tier = Math.min(KAGE, Math.floor(pts / 100)); r.seals = pts - r.tier * 100; } }
+  // rating moves at most 64 a game (the placement K factor)
+  const m0 = base ? base.mmr : 1000, dm = 64 * (r.g - g0) + (base ? 0 : 200); r.mmr = Math.max(m0 - dm, Math.min(m0 + dm, r.mmr));
+  return r;
+}
+
 function open(o = {}) {
   const log = o.log || (() => {});
   if (o.databaseUrl) return postgres(o.databaseUrl, log);
   if (o.memory) return memory();
   return null;
 }
-module.exports = { open, CODE_RE, hashCode, pubOf, cleanRank, cleanName, MODES, MAX_SAVE, KAGE, KAGE_TOP, VILLAGES, VW_MAX, VW_GAP, MATCH_MODES, VW_SKIP, weekOf };
+module.exports = { open, checkRank, RANK_GAME_MS, CODE_RE, hashCode, pubOf, cleanRank, cleanName, MODES, MAX_SAVE, KAGE, KAGE_TOP, VILLAGES, VW_MAX, VW_GAP, MATCH_MODES, VW_SKIP, weekOf };
